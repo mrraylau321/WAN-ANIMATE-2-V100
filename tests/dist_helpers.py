@@ -130,7 +130,7 @@ def guard_worker(rank, world, port, out_dir):
 
 
 def guard_count_worker(rank, world, port, out_dir):
-    """Codex's F6 repro: rank r holds r+1 records; every rank must raise the same error."""
+    """Review F6 repro: rank r holds r+1 records; every rank must raise the same error."""
     from datetime import timedelta
     res = {"rank": rank}
     try:

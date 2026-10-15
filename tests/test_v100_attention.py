@@ -231,7 +231,7 @@ def test_tiny_model_sdpa_equals_upstream_model(log_scale, upstream, monkeypatch)
     torch.testing.assert_close(out_sdpa, out_up, atol=1e-5, rtol=1e-5)
 
 
-# ------------------------------------------------------------------ Codex review F8: varlen padding
+# ------------------------------------------------------------------ Review F8: varlen padding
 def test_unequal_k_lens_slice_padding_away():
     """Like flash varlen packing: discarded padding (even NaN) never reaches another sample."""
     q = torch.ones(2, 1, 1, 4)
@@ -296,7 +296,7 @@ def test_outer_sdpa_kernel_context_is_respected():
 
 @pytest.mark.parametrize("backends", [[], "efficient_only"])
 def test_disabled_math_is_not_used_behind_the_callers_back(backends):
-    """Codex review r2 N3: with MATH disabled by the caller and no allowed fused kernel accepting
+    """Review r2 N3: with MATH disabled by the caller and no allowed fused kernel accepting
     the inputs (all disabled; or EFFICIENT only, which CPU does not have), the call must fail
     instead of silently running MATH."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -308,7 +308,7 @@ def test_disabled_math_is_not_used_behind_the_callers_back(backends):
 
 def test_backend_choice_is_per_call_not_cached(monkeypatch):
     """A rejected input (dropout: CPU fused kernels refuse it) must not push later, different
-    calls onto MATH (Codex review r2 N3 / repro_backend_cache.py)."""
+    calls onto MATH (review r2 N3 / repro_backend_cache.py)."""
     from wanxiang.models import attention_sdpa as S
     real, modes = S._sdpa_rows, []
 

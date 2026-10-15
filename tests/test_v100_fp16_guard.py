@@ -59,13 +59,13 @@ def test_fp16_cast_thresholds_exact():
 
 
 def test_load_check_original_magnitude_overflow_fails():
-    # Codex review F4a: 65519 would round to 65504 (finite) but exceeds the fp16 range
+    # Review F4a: 65519 would round to 65504 (finite) but exceeds the fp16 range
     with pytest.raises(FP16OverflowError, match=r"m: 1 values exceed the fp16 range"):
         check_fp16_castable([("m.weight", torch.tensor([65519.0]))], log=ListLog())
 
 
 def test_load_check_underflow_tolerance_is_loud_and_configurable():
-    # Codex review F4b (partially accepted): one flushed weight in 2000 is within the default
+    # Review F4b (partially accepted): one flushed weight in 2000 is within the default
     # per-module tolerance (1e-3) but is reported as a WARNING with count and max |w|;
     # underflow_frac=0 makes any flush fatal.
     w = torch.ones(2000)
@@ -284,7 +284,7 @@ def test_check_ckpt_script(tmp_path):
     assert allowed.returncode == 0, allowed.stdout
 
 
-# ------------------------------------------------------------------ Codex review F1: concealment
+# ------------------------------------------------------------------ Review F1: concealment
 class _Unit(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -297,7 +297,7 @@ class _Unit(torch.nn.Module):
 
 
 class CrossModel(torch.nn.Module):
-    """Codex's repro (review F1): real CrossAttention, finite weights that pass the fp16 load check,
+    """Review F1 repro: real CrossAttention, finite weights that pass the fp16 load check,
     but the normalised query component overflows in fp16 (65280 x 2) and, with negative keys, SDPA
     MATH returns a finite but wrong output (all zeros; the fp32 reference is all ones)."""
 
@@ -326,7 +326,7 @@ def test_concealed_attention_overflow_is_caught(mode, step):
     A.set_compute_dtype(torch.float16)
     x = torch.zeros(1, 2, 4, dtype=torch.float16)
     c = torch.zeros(1, 3, 4, dtype=torch.float16)
-    # (a) exactly Codex's setup: fp16 weights, MATH kernel
+    # (a) exactly the review's setup: fp16 weights, MATH kernel
     m = CrossModel().eval().half()
     check_fp16_castable(m.named_parameters(), log=ListLog())  # the weights are fine
     with torch.no_grad(), sdpa_kernel([SDPBackend.MATH]):
@@ -386,7 +386,7 @@ def _spawn(fn, args, tmp_path, n=2, timeout=120):
 
 
 def test_count_mismatch_aborts_on_every_rank(tmp_path):
-    """Codex review F6: unequal record counts must not send ranks into different branches."""
+    """Review F6: unequal record counts must not send ranks into different branches."""
     from dist_helpers import guard_count_worker
     from test_v100_state_dict import _free_port
     _spawn(guard_count_worker, (2, _free_port(), str(tmp_path)), tmp_path)
@@ -422,7 +422,7 @@ def test_assert_finite_sees_attention_flag_and_inf():
     g.remove()
 
 
-# ------------------------------------------------------------------ Codex review F5: CLIP order
+# ------------------------------------------------------------------ Review F5: CLIP order
 def test_clip_checked_before_the_fp16_cast():
     """prepare_clip sees the fp32 checkpoint values (a 1e-9 weight is still nonzero, a 1e5 weight
     is still 1e5) and only then casts; failures point at clip_dtype, not the DiT allow-list."""
@@ -467,7 +467,7 @@ def test_clip_checked_before_the_fp16_cast():
     assert clip.model.visual[0].weight[0, 0] == 1e5 and clip.dtype == torch.float32
 
 
-# ------------------------------------------------------------------ Codex review r2 N4: collectives
+# ------------------------------------------------------------------ Review r2 N4: collectives
 @pytest.mark.parametrize("step,expected", [(3, [(2,)]), (0, [(2,), (2,)])])
 def test_guard_collectives_per_forward(step, expected):
     """Non-detailed forward: 1 all-reduce of 2 floats (sentinel + kernel flag). Detailed forward:

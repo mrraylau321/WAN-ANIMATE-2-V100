@@ -1,4 +1,4 @@
-"""Codex review F2: failures anywhere in the workers end the launcher with a clear error and a
+"""Review F2: failures anywhere in the workers end the launcher with a clear error and a
 non-zero exit instead of waiting forever. Runs the real launcher path on CPU/gloo (see
 launcher_stub.py) in a subprocess with a hard timeout."""
 import os
@@ -54,7 +54,7 @@ def test_clean_run_returns_result_and_exits(tmp_path):
 @pytest.mark.parametrize("scenario,expect", [
     ("die_in_inference", "worker(s) exited without a report"),
     ("raise_in_inference", "worker 1: ValueError: injected inference failure on gpu 1"),
-    # Codex review r2 N1 (r2_artifacts/launcher_race.py): failure reported before rank 0's result
+    # Review r2 N1 (r2_artifacts/launcher_race.py): failure reported before rank 0's result
     ("fail_before_result", "worker 1: ValueError: injected failure before rank-0 result"),
     ("result_before_peer_failure", "worker 1: ValueError: injected failure after rank-0 result"),
     ("peer_death_at_completion", "(1, 3)"),

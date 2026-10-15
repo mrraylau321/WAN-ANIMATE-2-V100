@@ -224,7 +224,7 @@ def _spawn_json(fn, prefix, tmp_path, world=2, timeout=240):
 
 
 def test_t5_bf16_storage_fp32_compute_nothing_retained(tmp_path):
-    """Codex review F3b: FSDP1 keeps the ROOT unit's unsharded params after forward (4.2 GB fp32
+    """Review F3b: FSDP1 keeps the ROOT unit's unsharded params after forward (4.2 GB fp32
     for umT5-XXL). With the token embedding and final norm wrapped as their own units (V100 path)
     every unit is resharded after encoding. Weights stay bf16 as stored; compute is exact fp32."""
     from dist_helpers import t5_worker
@@ -238,7 +238,7 @@ def test_t5_bf16_storage_fp32_compute_nothing_retained(tmp_path):
 
 
 def test_context_parallel_kv_cache_owns_storage_and_matches(tmp_path):
-    """Codex review F3a: with context parallel the cached K/V must not keep the all_to_all
+    """Review F3a: with context parallel the cached K/V must not keep the all_to_all
     [q|k|v] buffer alive. Also: the sp=2 CP forward equals the single-process forward."""
     from dist_helpers import cp_worker
     res = _spawn_json(cp_worker, "cp", tmp_path)
@@ -262,7 +262,7 @@ def test_context_parallel_kv_cache_owns_storage_and_matches(tmp_path):
         torch.testing.assert_close(torch.load(tmp_path / f"cp_out_rank{r}.pt"), ref, atol=1e-5, rtol=1e-5)
 
 
-# ------------------------------------------------------------------ Codex review F7: YAML families
+# ------------------------------------------------------------------ Review F7: YAML families
 @pytest.mark.parametrize("cap", [(8, 0), (9, 0), (7, 0)])
 def test_v100_yaml_auto_equals_upstream_yaml(cap, monkeypatch):
     """Both YAML families resolve to the same runtime recipe on a mocked sm80/sm90 and sm70;
@@ -301,7 +301,7 @@ def test_dtype_bf16_forces_upstream_recipe_with_v100_yaml(monkeypatch):
         "dit=bf16 dit_output=bf16 t5=bf16 vae=bf16 clip=fp16 guard=off clip_text_on_gpu=True"
 
 
-# ------------------------------------------------------------------ Codex review r2 N2: no fp16 T5
+# ------------------------------------------------------------------ Review r2 N2: no fp16 T5
 @pytest.mark.parametrize("cfg", [
     {"t5_dtype": "fp16"},                                          # V100 path (fp16 DiT)
     {"t5_dtype": "float16", "dit_dtype": "bf16"},                  # upstream recipe + override
@@ -323,7 +323,7 @@ def test_fp32_and_bf16_t5_are_allowed(t5, monkeypatch):
     assert p.t5 == {"fp32": torch.float32, "bf16": torch.bfloat16, "auto": torch.float32}[t5]
 
 
-# ------------------------------------------------------------------ Codex review r2 R4
+# ------------------------------------------------------------------ Review r2 R4
 def test_kv_clone_only_on_the_port_path(monkeypatch):
     """flash backend (sm>=80 upstream path): the cache keeps upstream's tensors (views, no copy);
     SDPA backend (port): independent storage."""

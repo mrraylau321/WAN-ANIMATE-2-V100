@@ -63,7 +63,7 @@ def _patch():
     scenario = os.environ.get("WAN_TEST_SCENARIO", "ok")
 
     def fake_inference(item, gpu, *a, **k):
-        # Codex r2 race: both ranks finish their collectives, rank 1 then fails while rank 0
+        # Review r2 race: both ranks finish their collectives, rank 1 then fails while rank 0
         # still produces a (late) result
         if scenario == "fail_before_result":
             dist.barrier()
