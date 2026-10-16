@@ -173,6 +173,20 @@ def t5_autocast(prec):
     return nullcontext() if prec.upstream else torch.autocast(device_type="cuda", dtype=prec.t5)
 
 
+def debug_dump(name, obj, idex, gpu):
+    """Opt-in debugging (env WAN_DUMP_DIR): save first-clip stage tensors as fp32 CPU files
+    (rank-0 view) so two runs can be compared with scripts/compare_dumps.py. No-op otherwise."""
+    out = os.environ.get("WAN_DUMP_DIR")
+    if not out or idex != 1 or gpu != 0 or obj is None:
+        return
+    os.makedirs(out, exist_ok=True)
+    debug_dump.n = getattr(debug_dump, "n", 0) + 1
+    ts = obj.tensors if isinstance(obj, TensorList) else (list(obj) if isinstance(obj, (list, tuple)) else [obj])
+    ts = [t.detach().float().cpu() for t in ts]
+    t = torch.stack(ts) if len({tuple(x.shape) for x in ts}) == 1 else ts[0]
+    torch.save(t, os.path.join(out, f"{debug_dump.n:03d}_{name}.pt"))
+
+
 def gpu_memory_checkpoint(label, device, enabled=False):
     """Log measured CUDA peaks per phase; the offline estimator is not a GPU measurement."""
     if not enabled:
@@ -402,6 +416,7 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
             img = ref_pixel_values[0, :, 0]
             guard.begin_component()
             clip_context = clip.visual([img[:, None, :, :]]).to(dtype=prec.dit, device=device)
+            debug_dump("clip_context", clip_context, idex, gpu)
             clip_attn_ref = guard.attention_flag(device)
 
             msk_reft = get_i2v_mask(lat_t - 1, lat_h, lat_w, mask_reft_len, device=device)
@@ -433,10 +448,12 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
 
             y_reft = torch.concat([msk_reft, y_reft]).to(dtype=prec.dit, device=device)
             y = torch.concat([y_ref, y_reft], dim=1)
+            debug_dump("y", y, idex, gpu)
 
             condition_latents = vae_encode(vae, conditioning_pixel_values.to(prec.vae), prec)
             condition_latents = torch.stack(condition_latents)
             condition_latents = torch.cat([condition_latents], dim=2)
+            debug_dump("condition_latents", condition_latents, idex, gpu)
 
             B, C, T, H, W = conditioning_pixel_values.shape
             B, C, lat_t, lat_h, lat_w = condition_latents.shape
@@ -445,6 +462,7 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
             condition_img =  batch["conditioning_pixel_values"][0, :, 0]
             guard.begin_component()
             condition_clip_context = clip.visual([condition_img[:, None, :, :]]).to(dtype=prec.dit, device=device)
+            debug_dump("condition_clip_context", condition_clip_context, idex, gpu)
             clip_attn_cond = guard.attention_flag(device)
             
             mask_len = T
@@ -463,6 +481,7 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
 
             condition_msk_y = get_i2v_mask(lat_t, lat_h, lat_w, mask_len, device=device)
             condition_y = torch.concat([condition_msk_y, condition_y]).to(dtype=prec.dit, device=device)
+            debug_dump("condition_y", condition_y, idex, gpu)
 
             # V100 port: one collective inf/NaN check of every conditioning tensor (CLIP checked
             # including its attention kernels); all ranks raise the same error
@@ -482,6 +501,8 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
                 with t5_autocast(prec):  # fp32 on V100; upstream path: no extra context
                     context = t5(prompt)[0]
                     context_ref = t5(prompt_ref)[0]
+                debug_dump("t5_context", context, idex, gpu)
+                debug_dump("t5_context_ref", context_ref, idex, gpu)
                 guard.assert_finite("T5", {"T5 context (prompt)": context, "T5 context (prompt_ref)": context_ref},
                                     hints={"T5 context (prompt)": T5_HINT, "T5 context (prompt_ref)": T5_HINT})
 
@@ -536,6 +557,10 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
             timestep = torch.stack(timestep)
             guard.run(lambda: model(condition_latents, grid_sizes=grid_sizes, k_cache=k_cache, v_cache=v_cache, t=timestep,  method='forward_ref', **arg_ref_c),
                       step="ref", branch="ref")
+            for _layer in (0, 20, 39):
+                if _layer in k_cache:
+                    debug_dump(f"ref_k_layer{_layer:02d}", k_cache[_layer], idex, gpu)
+                    debug_dump(f"ref_v_layer{_layer:02d}", v_cache[_layer], idex, gpu)
             gpu_memory_checkpoint(f"chunk {idex} reference", device, log_gpu_memory)
             for i, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
@@ -559,6 +584,8 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
                     )
                 else:
                     noise_pred = noise_pred_cond
+                debug_dump(f"step{i}_noise_pred_cond", noise_pred_cond, idex, gpu)
+                debug_dump(f"step{i}_noise_pred", noise_pred, idex, gpu)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred[0].unsqueeze(0),
@@ -568,11 +595,13 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
                     generator=seed_g,
                 )[0]
                 latents[0] = temp_x0.squeeze(0)
+                debug_dump(f"step{i}_latents", latents, idex, gpu)
 
             gpu_memory_checkpoint(f"chunk {idex} denoising", device, log_gpu_memory)
             x0 = latents
             # 将latents转换为float32进行解码
             x0 = [x.to(dtype=torch.float32) for x in x0]
+            debug_dump("x0", x0, idex, gpu)
             if not prec.upstream:  # V100 port: free the reference K/V before VAE decode
                 k_cache.clear(); v_cache.clear()
             torch.cuda.empty_cache()
@@ -582,6 +611,7 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
                                     hints={"VAE decoded frames (before clamp)": VAE_HINT})
                 out_frames = out_frames.clamp_(-1, 1)
 
+            debug_dump("decoded_frames", out_frames, idex, gpu)
             out = (
                 rearrange(((out_frames + 1) * 127.5), "1 c t h w -> t h w c")
                 .detach()
