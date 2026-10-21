@@ -82,7 +82,7 @@ def test_conditioning_matches_move_mode_shapes(masks_npz, monkeypatch):
     bg = [((cond[0, :, k].permute(1, 2, 0).numpy() + 1) * 127.5) for k in range(clip_len)]
     for mrl in (0, 1):
         y, msk = rp.replace_conditioning(None, batch, bg, pm[:clip_len], mrl, H, W, lat_t, lat_h, lat_w,
-                                         None, "cpu")
+                                         None, "cpu", fill="grey", grow=0)
         assert msk.shape == get_i2v_mask(lat_t - 1, lat_h, lat_w, mrl, device="cpu").shape
         assert y.shape[1] == lat_t - 1
         person = torch.from_numpy(pm[mrl]).bool()
@@ -92,6 +92,43 @@ def test_conditioning_matches_move_mode_shapes(masks_npz, monkeypatch):
         assert 0 < msk.mean() < 1                                                 # per-pixel mask
         if mrl:
             assert torch.all(msk[:, 0] == 1)                                      # overlap frame known
+
+
+def test_hole_fill_uses_the_surrounding_background_not_a_foreign_colour():
+    n, H, W = 2, 64, 96
+    cond = torch.empty(3, n, H, W)
+    cond[:, :, :, :48] = -0.6                       # dark scene: left half
+    cond[:, :, :, 48:] = -0.2                       # right half
+    m = torch.zeros(n, H, W)
+    m[:, 16:48, 32:64] = 1                          # hole across the seam
+    cond[:, :, 16:48, 32:64] = 0.9                  # the person's own (bright) colour must not leak in
+    hole = m[0].bool()
+    blur = rp.fill_hole(cond, m, "blur")
+    assert blur[:, :, hole].min() >= -0.6 - 1e-4 and blur[:, :, hole].max() <= -0.2 + 1e-4
+    assert blur[0, 0, 32, 33] < blur[0, 0, 32, 62]  # left part of the hole darker, like its side
+    assert torch.equal(blur[:, :, ~hole], cond[:, :, ~hole])
+    assert torch.all(rp.fill_hole(cond, m, "grey")[:, :, hole] == 0)
+    assert torch.all(rp.fill_hole(cond, m, "black")[:, :, hole] == -1)
+    with pytest.raises(ValueError):
+        rp.fill_hole(cond, m, "pink")
+
+
+def test_grow_generates_one_more_latent_cell_around_the_hole(masks_npz, monkeypatch):
+    H, W = resize_by_area(np.zeros((H0, W0, 3), np.uint8), AREA, divisor=16).shape[:2]
+    pm = rp.load_person_masks(_cfg(replace_mask=masks_npz, replace_dilate=0), list(range(N)), AREA, 13)
+    clip_len, lat_h, lat_w = 9, H // 8, W // 8
+    lat_t = (clip_len + 1) // 4 + 2
+    monkeypatch.setattr(rp, "vae_encode", lambda vae, videos, prec: [torch.zeros(16, lat_t - 1, lat_h, lat_w)])
+    cond = torch.rand(1, 3, clip_len, H, W) * 2 - 1
+    batch = {"conditioning_pixel_values": cond, "pixel_values": torch.zeros(1, 3, 1, H, W)}
+    bg = [((cond[0, :, k].permute(1, 2, 0).numpy() + 1) * 127.5) for k in range(clip_len)]
+    gen = {}
+    for g in (0, 1):
+        _, msk = rp.replace_conditioning(None, batch, bg, pm[:clip_len], 0, H, W, lat_t, lat_h, lat_w, None, "cpu",
+                                         grow=g)
+        gen[g] = msk[0, 1] == 0                     # one generated frame: cells to generate
+    want = torch.nn.functional.max_pool2d(gen[0][None, None].float(), 3, stride=1, padding=1)[0, 0] > 0
+    assert gen[1].sum() > gen[0].sum() and torch.equal(gen[1], want)
 
 
 def test_composite_keeps_background_outside_the_hole(masks_npz):

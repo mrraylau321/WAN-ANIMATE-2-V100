@@ -6,8 +6,10 @@ so keep the copy in step if that function changes:
 
   1. one person mask per driving frame (scripts/make_person_mask.py), dilated by test_cfg.replace_dilate px
      (or its per-frame bounding box with test_cfg.replace_mask_mode=bbox);
-  2. the continuation conditioning y carries the driving frames with the person blanked out, and its mask
-     channels become per-pixel: 1 = keep (background, previous-clip frames), 0 = generate (person region).
+  2. the continuation conditioning y carries the driving frames with the person region filled with the
+     surrounding background colours (test_cfg.replace_fill=blur|grey|black), and its mask channels become
+     per-pixel: 1 = keep (background, previous-clip frames), 0 = generate (person region, grown by
+     test_cfg.replace_grow latent cells).
      The public weights were trained with whole-frame masks only, so this input is out of distribution;
   3. the generated frames are pasted back onto the original background with a feathered mask
      (results.mp4); the unblended model output is saved as results_raw.mp4.
@@ -71,21 +73,64 @@ def load_background_frames(cfg, idxs, area, target_len, n_frames):
     return zigzag_padding([resize_by_area(f, area, divisor=16) for f in frames], target_len)
 
 
-def replace_conditioning(vae, batch, clip_bg, clip_masks, mask_reft_len, H, W, lat_t, lat_h, lat_w, prec, device):
-    """(y_reft, msk_reft) for one clip: VAE latents of the background frames with the person blanked
-    and the matching per-pixel mask channels (same shapes as the move-mode tensors they replace)."""
+def fill_hole(cond, m, fill="blur", scale=8):
+    """cond 3,n,H,W in [-1, 1]; m n,H,W (1 = hole). Returns cond with the hole filled (grey | black | blur).
+    blur: normalized convolution of the known pixels at 1/scale resolution, widened until every hole pixel
+    has known neighbours (the hole gets the surrounding background colours, no foreign colour)."""
+    if fill == "grey":
+        return cond * (1 - m)[None]
+    if fill == "black":
+        return cond * (1 - m)[None] - m[None]
+    if fill != "blur":
+        raise ValueError(f"test_cfg.replace_fill must be grey, black or blur, not {fill!r}")
+    out = cond.clone()
+    H, W = m.shape[1:]
+    sw, sh = max(1, W // scale), max(1, H // scale)
+    for t in range(m.shape[0]):
+        hole = m[t].numpy() > 0.5
+        if not hole.any() or hole.all():
+            out[:, t] = cond[:, t] * (1 - m[t])[None]      # nothing to fill / nothing to fill from: grey
+            continue
+        img = cond[:, t].permute(1, 2, 0).numpy()
+        keep = cv2.resize((~hole).astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA)
+        f = cv2.resize(img * (~hole)[..., None], (sw, sh), interpolation=cv2.INTER_AREA)  # known pixels only
+        est = np.zeros_like(f); done = np.zeros((sh, sw), bool); k = 3
+        while not done.all():
+            num, den = cv2.blur(f, (k, k)), cv2.blur(keep, (k, k))
+            new = (den > 1e-3) & ~done
+            est[new] = num[new] / den[new][:, None]
+            done |= new; k = 2 * k + 1
+        est = cv2.resize(est, (W, H), interpolation=cv2.INTER_LINEAR)
+        img = img.copy(); img[hole] = est[hole]
+        out[:, t] = torch.from_numpy(img).permute(2, 0, 1)
+    return out
+
+
+def replace_conditioning(vae, batch, clip_bg, clip_masks, mask_reft_len, H, W, lat_t, lat_h, lat_w, prec, device,
+                         fill="blur", grow=1):
+    """(y_reft, msk_reft) for one clip: VAE latents of the background frames with the person region filled
+    and the matching per-pixel mask channels (same shapes as the move-mode tensors they replace).
+
+    fill: what goes into the hole before VAE encoding. "grey" (0, like move mode's unknown frames) leaks
+    into the neighbouring KEPT latent cells through the VAE's receptive field and shows up as a light rim
+    on dark scenes; "blur" (default) uses the surrounding background colours instead; "black" = v1.
+    grow: extra latent cells (8 px each) around the hole that are generated instead of kept, so the
+    cells that saw the fill are redrawn by the model."""
     n = batch["conditioning_pixel_values"].shape[2]
     cond = torch.from_numpy(np.stack(clip_bg[:n]).astype(np.float32) / 127.5 - 1).permute(3, 0, 1, 2)
     cond = F.interpolate(cond, size=(H, W), mode="bicubic")                # 3, n, H, W in [-1, 1]
     m = torch.from_numpy(np.stack(clip_masks[:n])).float()[None]           # 1, n, h, w (1 = person)
     m = F.interpolate(m, size=(H, W), mode="nearest")[0]                   # n, H, W
-    frames = cond * (1 - m)[None]                                          # person -> 0 (grey, like unknown frames)
+    frames = fill_hole(cond, m, fill)
     if mask_reft_len > 0:  # previous-clip frames stay fully known, exactly as in move mode
         frames[:, :mask_reft_len] = F.interpolate(batch["pixel_values"][0, :, :mask_reft_len].float().cpu(),
                                                   size=(H, W), mode="bicubic")
     dtype = batch["conditioning_pixel_values"].dtype
     y_reft = vae_encode(vae, [frames.to(device=device, dtype=dtype)], prec)[0]
-    known = 1 - F.max_pool2d(m[:, None], kernel_size=8)[:, 0]              # n, lat_h, lat_w: any person pixel -> generate
+    gen = F.max_pool2d(m[:, None], kernel_size=8)                          # n, 1, lat_h, lat_w: any person pixel -> generate
+    if grow > 0:
+        gen = F.max_pool2d(gen, kernel_size=2 * grow + 1, stride=1, padding=grow)
+    known = 1 - gen[:, 0]
     msk_reft = get_i2vmask_mask(known[None].to(device), lat_t - 1, lat_h, lat_w, mask_reft_len, device=device)
     return y_reft, msk_reft
 
@@ -310,7 +355,9 @@ def inference_core_replace(item, gpu, cfg, clip, vae, model, t5, use_t5, context
             # (1 = keep background / continuation frames, 0 = generate the new character there)
             y_reft, msk_reft = replace_conditioning(vae, batch, bg_images[start:start + CLIP_LEN],
                                                     person_masks[start:start + CLIP_LEN],
-                                                    mask_reft_len, H, W, lat_t, lat_h, lat_w, prec, device)
+                                                    mask_reft_len, H, W, lat_t, lat_h, lat_w, prec, device,
+                                                    fill=str(cfg.test_cfg.get("replace_fill", "blur")),
+                                                    grow=int(cfg.test_cfg.get("replace_grow", 1)))
             y_reft = torch.concat([msk_reft, y_reft]).to(dtype=prec.dit, device=device)
             y = torch.concat([y_ref, y_reft], dim=1)
             debug_dump("y", y, idex, gpu)
