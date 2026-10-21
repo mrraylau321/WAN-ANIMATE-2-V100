@@ -40,7 +40,8 @@ GDINO=${GDINO:-$CKPT_DIR/grounding-dino-base}; [[ -d $GDINO ]] || GDINO=IDEA-Res
 SAM2=${SAM2:-$CKPT_DIR/sam2.1-hiera-large}; [[ -d $SAM2 ]] || SAM2=facebook/sam2.1-hiera-large
 GPU0=${GPUS%%,*}
 if [[ $SEGMENTER == gsam2 ]]; then
-  MASK=${MASK:-$WORK_DIR/$(basename "${DRIVE%.*}")_$(echo "$TARGET" | tr -c 'A-Za-z0-9\n' '_')_mask.npz}
+  # own name per segmenter + target, so a SegFormer mask of the same video is never reused by mistake
+  MASK=${MASK:-$WORK_DIR/$(basename "${DRIVE%.*}")_gsam2_$(echo "$TARGET" | tr -c 'A-Za-z0-9\n' '_')_mask.npz}
   [[ -f $MASK ]] || CUDA_VISIBLE_DEVICES=$GPU0 python scripts/grounded_sam2.py video --video "$DRIVE" \
     --target "$TARGET" --out "$MASK" --gdino "$GDINO" --sam2 "$SAM2"
 elif [[ $SEGMENTER == segformer ]]; then

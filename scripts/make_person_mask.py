@@ -18,7 +18,19 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from decord import VideoReader
+try:
+    import imageio.v2 as imageio
+except ImportError:  # older imageio
+    import imageio
 from transformers import AutoImageProcessor, AutoModelForSemanticSegmentation
+
+
+def write_preview(path, frames, fps):
+    """H.264 mp4 (plays in VS Code / browsers; OpenCV's mp4v does not). Even size for yuv420p."""
+    writer = imageio.get_writer(path, fps=fps, codec="libx264", macro_block_size=1, ffmpeg_params=["-crf", "23"])
+    for f in frames:
+        writer.append_data(f[: f.shape[0] // 2 * 2, : f.shape[1] // 2 * 2])
+    writer.close()
 
 
 def person_ids(id2label):
@@ -57,14 +69,12 @@ def main():
     masks = np.stack(masks)
     np.savez_compressed(out, masks=masks)
 
-    writer = cv2.VideoWriter(preview, cv2.VideoWriter_fourcc(*"mp4v"), reader.get_avg_fps(),
-                             (masks.shape[2], masks.shape[1]))
-    for i in range(n):
+    def overlay(i):
         frame = reader[i].asnumpy().copy()
         sel = masks[i] > 0
         frame[sel] = (0.5 * frame[sel] + [127, 0, 0]).astype(np.uint8)
-        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-    writer.release()
+        return frame
+    write_preview(preview, (overlay(i) for i in range(n)), reader.get_avg_fps())
     empty = int(np.sum(masks.reshape(n, -1).max(1) == 0))
     print(f"{n} masks -> {out}  (person area {np.mean(masks > 0):.1%}; empty frames: {empty})\npreview -> {preview}")
 
