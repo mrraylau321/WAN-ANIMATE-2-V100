@@ -322,6 +322,57 @@ How to read the labels:
 * A `FALLBACK` line means the result is recomputed in fp32 for that block, which is slower. If the
   same block falls back on every run, add it to `fp32_modules`.
 
+## Experimental: replace mode (unofficial hypothesis)
+
+> **Status: an unofficial experiment, not a feature of the released Wan-Animate-2.** The authors' code
+> ships only the animation ("move") mode, and a hosted API for this model states that it "does not
+> include a replace mode". What follows is our hypothesis about how the public weights can still
+> replace a person **without fine-tuning**. It is validated only qualitatively: on the official demo
+> (`examples/demo1`, 4× V100 32 GB, 480p, Distillation) the character lands in the original scene and
+> follows the original motion, with visible artifacts (see the limits below).
+
+**Hypothesis.** The generation input is 16 noise + 4 mask + 16 conditioning-latent channels. The 4 mask
+channels are per pixel by construction (one value per latent cell and frame, 4 frames packed per latent
+frame); the released inference only ever uses whole-frame patterns (reference slot and overlap frame known,
+everything else generated). Replace mode puts the **original frames with the person blanked** into the
+conditioning latent and marks **background = 1 (keep), person region = 0 (generate)**. Generation then
+becomes inpainting of that region. Identity still comes from the reference slot + CLIP, and motion still
+comes from the driving branch, which is the same video, so the motion lands where the person was. This is
+the same mechanism as Wan-Animate v1's replace path (`wan/animate.py` in Wan2.2: background video + `1 −
+mask` packed by `get_i2v_mask(mask_pixel_values=…)`). This codebase still contains the matching, never-called
+helper `wanxiang/eval_i2v.py:get_i2vmask_mask`, which the replace pipeline uses.
+
+**Files (new; the original pipeline is not modified):**
+
+| file | role |
+|---|---|
+| `pipelines/wan_animate_2_replace_pipeline.py` | `inference_core` copied with three marked `REPLACE MODE` edits: per-frame masks, background + per-pixel mask conditioning, feathered paste onto the original (`results.mp4`) + raw model output (`results_raw.mp4`) |
+| `scripts/make_person_mask.py` | person masks per frame with a Hugging Face SegFormer (`mattmdjaga/segformer_b2_clothes` by default; any mask video also works) |
+| `scripts/retarget_driving.py` | optional: rescale the driving person around the feet (`SCALE`) so the character is drawn smaller or larger; the original video stays the background |
+| `scripts/run_v100_replace.sh` | launcher (wraps `scripts/run_v100.sh`) |
+
+```bash
+# once: the mask model (~110 MB)
+hf download mattmdjaga/segformer_b2_clothes config.json preprocessor_config.json model.safetensors \
+  --local-dir $CKPT_DIR/segformer_b2_clothes
+CKPT_DIR=<ckpts> DRIVE=<video> REF_IMG=<image> PROMPT_FILE=<prompt.txt> MASK_MODE=bbox \
+  bash scripts/run_v100_replace.sh                 # add SCALE=0.6 to draw the character at 60 % height
+```
+
+**Known limits (first runs):**
+
+* **A silhouette hole leaks shape.** The character is forced into the original person's outline; a
+  `MASK_MODE=bbox` hole leaves room. Wan-Animate v1 also defaults to a box-like mask.
+* **The prompt's background must describe the real scene.** The demo prompt says "pure white background",
+  which produced white patches inside the hole.
+* **Proportions follow the driving person.** `SCALE` rescales the whole person; per-part proportions
+  (a big head on a small body) are not handled. A single reference image carries no real-world size, so
+  `SCALE` is chosen by hand.
+* **Mask quality matters.** Missed limbs leave the original person visible; props merged into the person
+  mask are replaced (or rescaled) too.
+* **No relighting.** v1 has a dedicated relighting LoRA. The hole is filled with grey (v1: black).
+* **Cost.** Same DiT work as move mode, plus one mask pass and seconds of CPU blending.
+
 ## Known differences vs the official A800 path
 
 1. fp16 instead of bf16 compute, so expect small numeric drift. The residual stream between blocks
