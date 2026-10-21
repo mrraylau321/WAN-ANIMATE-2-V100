@@ -44,7 +44,7 @@ from wanxiang.eval_i2v import T5Encoder, CLIP, get_i2v_mask
 from wanxiang.distributed.fsdp import shard_model, shard_transformer
 from wanxiang.models import attention as wan_attention
 from wanxiang.utils.precision import resolve_precision, parse_dtype
-from wanxiang.utils.fp16_guard import check_fp16_castable, force_fp32, OverflowGuard
+from wanxiang.utils.fp16_guard import check_fp16_castable_cached, force_fp32, OverflowGuard
 
 from pipelines.utils.multiclip_utils import zigzag_padding, get_padding_len
 from pipelines.utils.human_video_omni_utils import resize_by_area, get_frame_indices
@@ -661,8 +661,9 @@ def prepare_clip(clip, prec, log=None):
     """V100 port: CLIP was strictly loaded in fp32 (checkpoint values unrounded). Check that the
     visual tower survives the cast to prec.clip, then cast it (and the unused text tower)."""
     if prec.clip == torch.float16:
-        check_fp16_castable(clip.model.visual.named_parameters(), underflow_frac=prec.underflow_frac,
-                            log=log, what="CLIP visual", hint=CLIP_HINT)
+        check_fp16_castable_cached(clip.model.visual.named_parameters, [getattr(clip, "checkpoint_path", None)],
+                                   underflow_frac=prec.underflow_frac, log=log, what="CLIP visual",
+                                   hint=CLIP_HINT)
     clip.model.visual = clip.model.visual.to(prec.clip)
     clip.model.textual = clip.model.textual.to(prec.clip)
     clip.dtype = prec.clip  # CLIP.visual() autocasts to clip.dtype
@@ -755,9 +756,9 @@ def build_dit(cfg, device, prec, gpu):
     # dtype conversion happens after loading (FSDP2 casts the loaded fp32 shards per forward);
     # verify that cast is lossless enough before running anything in fp16.
     if prec.dit == torch.float16:
-        check_fp16_castable(model.named_parameters(), fp32_modules=fp32_modules,
-                            underflow_frac=prec.underflow_frac,
-                            group=fsdp_mesh.get_group("shard"), log=logger, what="DiT")
+        check_fp16_castable_cached(model.named_parameters, [cfg.get("model_path", None)], fp32_modules=fp32_modules,
+                                   underflow_frac=prec.underflow_frac,
+                                   group=fsdp_mesh.get_group("shard"), log=logger, what="DiT")
     for name in fp32_modules:
         force_fp32(model.get_submodule(name), device_type=device_type)
     return model, fp32_modules

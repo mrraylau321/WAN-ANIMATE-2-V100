@@ -1,6 +1,7 @@
 """fp16 safety net: load-time castability check and runtime overflow guard fire when they should.
 CPU only, tiny configs; large values / NaNs are injected on purpose."""
 import json
+import os
 
 import pytest
 import torch
@@ -481,3 +482,58 @@ def test_guard_collectives_per_forward(step, expected):
     g.run(lambda: torch.ones(1), step=step, branch="cond")
     g.remove()
     assert calls == expected
+
+
+# --------------------------------------------------------------- pass markers (WAN_FP16_CHECK)
+def _counting(params):
+    calls = []
+
+    def named_params():
+        calls.append(1)
+        return iter(params)
+    return named_params, calls
+
+
+def test_cached_check_skips_only_the_same_files_and_settings(tmp_path, monkeypatch):
+    """auto: the first run checks and records a pass; the same file + settings skip; a changed
+    file, changed settings or WAN_FP16_CHECK=force check again; off skips with a warning."""
+    from wanxiang.utils.fp16_guard import check_fp16_castable_cached
+    ckpt = tmp_path / "w.safetensors"
+    ckpt.write_bytes(b"weights")
+    good = [("m.weight", torch.ones(4))]
+    np_, calls = _counting(good)
+    check_fp16_castable_cached(np_, [str(ckpt)], log=ListLog())
+    check_fp16_castable_cached(np_, [str(ckpt)], log=ListLog())
+    assert len(calls) == 1                                    # second run skipped
+    check_fp16_castable_cached(np_, [str(ckpt)], fp32_modules=["m"], log=ListLog())
+    assert len(calls) == 2                                    # different settings -> checked
+    os.utime(ckpt, ns=(1, 1))
+    check_fp16_castable_cached(np_, [str(ckpt)], log=ListLog())
+    assert len(calls) == 3                                    # file changed -> checked
+    monkeypatch.setenv("WAN_FP16_CHECK", "force")
+    check_fp16_castable_cached(np_, [str(ckpt)], log=ListLog())
+    assert len(calls) == 4                                    # force -> checked
+    monkeypatch.setenv("WAN_FP16_CHECK", "off")
+    log = ListLog()
+    check_fp16_castable_cached(np_, [str(ckpt)], log=log)
+    assert len(calls) == 4 and any(k == "warning" and "SKIPPED" in m for k, m in log.lines)
+    monkeypatch.setenv("WAN_FP16_CHECK", "sometimes")
+    with pytest.raises(ValueError):
+        check_fp16_castable_cached(np_, [str(ckpt)], log=ListLog())
+
+
+def test_cached_check_never_records_a_failure_or_an_unknown_file(tmp_path):
+    from wanxiang.utils.fp16_guard import check_fp16_castable_cached
+    ckpt = tmp_path / "bad.safetensors"
+    ckpt.write_bytes(b"weights")
+    bad = [("m.weight", torch.tensor([65519.0]))]
+    np_, calls = _counting(bad)
+    for _ in range(2):  # still raises on every run: nothing was recorded
+        with pytest.raises(FP16OverflowError):
+            check_fp16_castable_cached(np_, [str(ckpt)], log=ListLog())
+    assert len(calls) == 2
+    np_, calls = _counting([("m.weight", torch.ones(4))])
+    for src in (None, str(tmp_path / "missing.safetensors")):  # unknown file: always checked
+        check_fp16_castable_cached(np_, [src], log=ListLog())
+        check_fp16_castable_cached(np_, [src], log=ListLog())
+    assert len(calls) == 4

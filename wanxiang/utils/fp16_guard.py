@@ -3,13 +3,18 @@
 1. ``check_fp16_castable``  load-time: per-module stats of casting the loaded weights to fp16
    (non-finite, overflow -> inf, nonzero flushed to 0, subnormal). Raises on any violation
    unless the module is explicitly listed in ``fp32_modules`` (non-finite always raises).
+   ``check_fp16_castable_cached`` skips it for weight files that already passed with the same
+   settings (fingerprint marker); env WAN_FP16_CHECK=auto (default) | force | off.
 2. ``force_fp32``           runs one module in fp32 (args upcast, fp32 autocast on CUDA, fp32 SDPA).
 3. ``OverflowGuard``        runtime: forward hooks record max|x| of block / attention / FFN /
    modulation tensors (one host sync per checked forward), a cheap sentinel checks every model
    output, and on a non-finite value the first offending module + step is logged and the run
    either aborts or re-runs that forward with the offending block switched to fp32.
 """
+import hashlib
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -152,6 +157,72 @@ def check_fp16_castable(named_params, fp32_modules=(), underflow_frac=1e-3, grou
         log.error(msg)
         raise FP16OverflowError(msg)
     return per_mod
+
+
+def fp16_check_mode():
+    """WAN_FP16_CHECK: auto (default: check, skip weight files that already passed), force, off."""
+    mode = os.environ.get("WAN_FP16_CHECK", "auto").strip().lower()
+    if mode not in ("auto", "force", "off"):
+        raise ValueError(f"WAN_FP16_CHECK must be auto, force or off (got {mode!r})")
+    return mode
+
+
+def fp16_check_marker(what, sources, settings):
+    """Path of the 'passed' marker for these weight files (path, size, mtime) + check settings.
+    Any change to a file or to the settings gives a different path, so the check runs again.
+    None (= always check, never cache) when a weight file is unknown or missing."""
+    if not sources or not all(src and os.path.isfile(str(src)) for src in sources):
+        return None
+    items = [what, settings]
+    for src in sources:
+        st = os.stat(src)
+        items.append([os.path.abspath(src), st.st_size, st.st_mtime_ns])
+    key = hashlib.sha256(json.dumps(items, sort_keys=True, default=str).encode()).hexdigest()[:20]
+    cache = os.environ.get("WAN_FP16_CHECK_CACHE",
+                           os.path.join(os.path.expanduser("~"), ".cache", "wan_animate2_v100", "fp16_check"))
+    tag = re.sub(r"[^A-Za-z0-9]+", "_", what).strip("_")
+    return os.path.join(cache, f"{tag}-{key}.ok")
+
+
+def _all_agree(flag, group):
+    """True only if every rank of ``group`` has flag=True (keeps collective calls in lockstep)."""
+    if group is None or not (dist.is_available() and dist.is_initialized()):
+        return flag
+    dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    t = torch.tensor([1 if flag else 0], device=dev)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group)
+    return bool(t.item())
+
+
+def check_fp16_castable_cached(named_params, sources, fp32_modules=(), underflow_frac=1e-3, group=None,
+                               log=None, what="DiT", hint=None):
+    """check_fp16_castable, skipped when these exact weight files already passed with the same
+    settings. ``named_params`` is a callable returning the (name, param) iterator, so a skipped
+    check does not touch the weights. A failed check never writes a marker (it raises)."""
+    log = log or _log
+    mode = fp16_check_mode()
+    if mode == "off":
+        log.warning(f"[fp16-check] {what}: SKIPPED (WAN_FP16_CHECK=off); weights that do not fit fp16 "
+                    "would fail silently")
+        return
+    marker = fp16_check_marker(what, sources, {"fp32_modules": sorted(fp32_modules),
+                                               "underflow_frac": underflow_frac})
+    if _all_agree(mode == "auto" and marker is not None and os.path.exists(marker), group):
+        log.info(f"[fp16-check] {what}: these weight files already passed ({marker}); skipped. "
+                 "WAN_FP16_CHECK=force re-checks")
+        return
+    check_fp16_castable(named_params(), fp32_modules=fp32_modules, underflow_frac=underflow_frac,
+                        group=group, log=log, what=what, hint=hint)
+    if marker is None:
+        return
+    try:  # passed: remember it (atomic, so concurrent ranks never see a half-written marker)
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        tmp = f"{marker}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"what": what, "sources": [os.path.abspath(s) for s in sources]}, f)
+        os.replace(tmp, marker)
+    except OSError as e:  # a read-only cache only costs the next run its 3 minutes
+        log.warning(f"[fp16-check] could not write {marker}: {e}")
 
 
 # ----------------------------------------------------------------------------- fp32 islands

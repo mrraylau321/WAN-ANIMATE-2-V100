@@ -23,6 +23,13 @@ TINY = dict(patch_size=(1, 2, 2), in_dim=36, dim=64, ffn_dim=128, freq_dim=32, t
             refer_stride=1, sparse_type=0, use_context_parallel=False, log_scale=-1.3)
 
 
+@pytest.fixture(autouse=True)
+def _fp16_check_cache(tmp_path, monkeypatch):
+    """Keep fp16-check pass markers inside each test's tmp dir (never ~/.cache, never shared)."""
+    monkeypatch.setenv("WAN_FP16_CHECK_CACHE", str(tmp_path / "fp16_check"))
+    monkeypatch.delenv("WAN_FP16_CHECK", raising=False)
+
+
 def git_show(path, commit=UPSTREAM_COMMIT):
     return subprocess.run(["git", "-C", REPO, "show", f"{commit}:{path}"], check=True,
                           capture_output=True, text=True).stdout
