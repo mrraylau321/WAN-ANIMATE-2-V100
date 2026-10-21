@@ -187,6 +187,8 @@ def test_launcher_wires_retarget_and_replace(tmp_path):
     py.write_text('#!/bin/bash\n'
                   'if [[ "$1" == -c ]]; then exec "%s" "$@"; fi\n'
                   'if [[ "$1" == scripts/make_person_mask.py ]]; then echo "MASKGEN $*"; touch "$5"; exit 0; fi\n'
+                  'if [[ "$1" == scripts/grounded_sam2.py ]]; then echo "GSAM2 $*"; '
+                  'while [[ $# -gt 0 ]]; do [[ "$1" == --out ]] && touch "$2"; shift; done; exit 0; fi\n'
                   'if [[ "$1" == scripts/retarget_driving.py ]]; then echo "RETARGET $*"; pre="${@: -1}"; '
                   'touch "${pre}_retarget_s0.6.mp4" "${pre}_hole_s0.6.npz"; exit 0; fi\n'
                   'if [[ "$1" == wan_animate_2_demo.py ]]; then printf "ARG %%s\\n" "$@"; exit 0; fi\n'
@@ -204,12 +206,67 @@ def test_launcher_wires_retarget_and_replace(tmp_path):
     ref.write_bytes(b"")
     env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", CKPT_DIR=str(ck), DRIVE=str(drive),
                REF_IMG=str(ref), PROMPT="a cat", SCALE="0.60", MASK_MODE="bbox", GPUS="0,1",
+               SCENE_REF="1", REF_TARGET="cat", TARGET="spinning top",
                MASK=str(tmp_path / "m.npz"), OUT_DIR=str(tmp_path / "out"), WORK_DIR=str(tmp_path / "work"))
     p = subprocess.run(["bash", os.path.join(REPO, "scripts", "run_v100_replace.sh")], env=env,
                        capture_output=True, text=True, timeout=60)
     out = p.stdout + p.stderr
     assert p.returncode == 0, out[-2000:]
-    assert "MASKGEN" in out and "--scale 0.6 " in out                     # 0.60 normalised
+    assert "GSAM2 scripts/grounded_sam2.py video" in out and "--target spinning top" in out
+    assert "GSAM2 scripts/grounded_sam2.py scene-ref" in out and "--ref-target cat" in out
+    assert "ref_scene.png" in out                                         # the scene ref is what runs
+    assert "--scale 0.6 " in out                                          # 0.60 normalised
     assert "type=pipelines.wan_animate_2_replace_pipeline.WanAnimate2ReplacePipeline" in out
     assert f"test_cfg.replace_background_video={drive}" in out           # original = background
     assert "clip_retarget_s0.6.mp4" in out and "clip_hole_s0.6.npz" in out and "replace_mask_mode=bbox" in out
+
+
+def _gsam2():
+    stub_heavy_video_deps()
+    return runpy.run_path(os.path.join(REPO, "scripts", "grounded_sam2.py"))
+
+
+def test_main_object_keeps_split_parts_and_drops_a_bystander():
+    g = _gsam2()
+    m = np.zeros((200, 100), bool)
+    m[40:180, 40:70] = True     # body
+    m[100:110, 72:80] = True    # hand split off by motion blur (2 px gap)
+    m[5:20, 0:10] = True        # bystander's arm, far away
+    kept = g["main_object"](m)
+    assert kept[105, 75] and not kept[10, 5] and kept[100, 50]
+
+
+def test_clean_plate_ignores_the_target_and_fills_never_seen_pixels(monkeypatch):
+    g = _gsam2()
+    n, h, w = 20, 60, 40
+    frames = []
+    masks = np.zeros((n, h, w), np.uint8)
+    for i in range(n):
+        f = np.full((h, w, 3), 100, np.uint8)
+        x = 2 * i                                   # a "person" walking across the frame
+        f[20:50, x:x + 6] = 250
+        masks[i, 20:50, x:x + 6] = 255
+        f[0:10, 0:10] = 250                         # a corner always hidden by a static target
+        masks[i, 0:10, 0:10] = 255
+        frames.append(f)
+    reader = types.SimpleNamespace(__len__=lambda: n)
+
+    class R:
+        def __init__(self, path):
+            pass
+
+        def __len__(self):
+            return n
+
+        def __getitem__(self, i):
+            return types.SimpleNamespace(asnumpy=lambda: frames[i])
+    g["clean_plate"].__globals__["VideoReader"] = R
+    plate, unseen = g["clean_plate"]("v.mp4", masks, dilate=1)
+    assert abs(int(plate[35, 20, 0]) - 100) <= 2           # the walker is gone
+    assert abs(int(plate[2, 2, 0]) - 100) <= 10 and unseen > 0   # hidden corner filled from around
+
+
+def test_cover_crops_to_the_exact_size():
+    g = _gsam2()
+    out = g["cover"](np.zeros((100, 300, 3), np.uint8), 64, 128)
+    assert out.shape == (128, 64, 3)

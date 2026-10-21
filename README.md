@@ -347,24 +347,26 @@ helper `wanxiang/eval_i2v.py:get_i2vmask_mask`, which the replace pipeline uses.
 | file | role |
 |---|---|
 | `pipelines/wan_animate_2_replace_pipeline.py` | `inference_core` copied with three marked `REPLACE MODE` edits: per-frame masks, background + per-pixel mask conditioning, feathered paste onto the original (`results.mp4`) + raw model output (`results_raw.mp4`) |
-| `scripts/make_person_mask.py` | person masks per frame with a Hugging Face SegFormer (`mattmdjaga/segformer_b2_clothes` by default; any mask video also works) |
+| `scripts/grounded_sam2.py` | default segmenter (Grounded-SAM2 via `transformers`, no extra pip): a text `TARGET` ("person", "spinning top", ...) → Grounding DINO box → SAM2 pixel masks tracked through the video (the box is only SAM2's prompt). `scene-ref` puts the reference character on the video's own background (clean plate) |
+| `scripts/make_person_mask.py` | alternative segmenter (`SEGMENTER=segformer`): a human-parsing SegFormer; misses dark limbs on dark stages |
 | `scripts/retarget_driving.py` | optional: rescale the driving person around the feet (`SCALE`) so the character is drawn smaller or larger; the original video stays the background |
 | `scripts/run_v100_replace.sh` | launcher (wraps `scripts/run_v100.sh`) |
 
 ```bash
-# once: the mask model (~110 MB)
-hf download mattmdjaga/segformer_b2_clothes config.json preprocessor_config.json model.safetensors \
-  --local-dir $CKPT_DIR/segformer_b2_clothes
-CKPT_DIR=<ckpts> DRIVE=<video> REF_IMG=<image> PROMPT_FILE=<prompt.txt> MASK_MODE=bbox \
-  bash scripts/run_v100_replace.sh                 # add SCALE=0.6 to draw the character at 60 % height
+# once: the segmentation models (~0.9 GB each)
+hf download IDEA-Research/grounding-dino-base --local-dir $CKPT_DIR/grounding-dino-base
+hf download facebook/sam2.1-hiera-large --local-dir $CKPT_DIR/sam2.1-hiera-large
+CKPT_DIR=<ckpts> DRIVE=<video> REF_IMG=<image> PROMPT_FILE=<prompt.txt> TARGET=person \
+  SCENE_REF=1 REF_TARGET=cat bash scripts/run_v100_replace.sh   # SCALE=0.6: character at 60 % height
 ```
 
 **Known limits (first runs):**
 
 * **A silhouette hole leaks shape.** The character is forced into the original person's outline; a
   `MASK_MODE=bbox` hole leaves room. Wan-Animate v1 also defaults to a box-like mask.
-* **The prompt's background must describe the real scene.** The demo prompt says "pure white background",
-  which produced white patches inside the hole.
+* **The prompt's background must describe the real scene, and so must the reference image's.** The
+  reference slot is copied too: a white studio backdrop in the reference reappeared inside a box-shaped
+  hole even with a stage prompt. `SCENE_REF=1` puts the character on the video's own background first.
 * **Proportions follow the driving person.** `SCALE` rescales the whole person; per-part proportions
   (a big head on a small body) are not handled. A single reference image carries no real-world size, so
   `SCALE` is chosen by hand.
