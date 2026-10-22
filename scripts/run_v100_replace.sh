@@ -7,7 +7,8 @@
 # Required: CKPT_DIR, DRIVE, REF_IMG, and PROMPT (text) or PROMPT_FILE. Describe the new character and
 #           the REAL scene of the driving video in the prompt's background part.
 # Optional: GPUS=0,1,2,3  RES=480p  MODE=distill|base  SEED=42  OUT_DIR=~/ray_runs/replace
-#           MASK_MODE=dilate|bbox (bbox: the hole is the person's box, no silhouette constraint)
+#           MASK_MODE=dilate|bbox|frame (bbox: the hole is the person's box, no silhouette constraint;
+#                      frame: the whole frame minus a BORDER=32 px strip of the real video; use GROW=0)
 #           DILATE=15 (px)  MASK=<.npz or mask video, white = target; made once if missing>
 #           FILL=grey|blur|black  what the hole holds before VAE encoding (grey is the only fill the model
 #                      draws into; blur/black get copied)   GROW=5 (latent cells around the hole that are
@@ -80,6 +81,6 @@ export GPUS CKPT_DIR DRIVE REF_IMG OUT_DIR PROMPT
 export MODE=${MODE:-distill} RES=${RES:-480p} SEED=${SEED:-42} MASTER_PORT=${MASTER_PORT:-29517}
 export EXTRA_OVERRIDES="type=pipelines.wan_animate_2_replace_pipeline.WanAnimate2ReplacePipeline \
 test_cfg.replace_mask=$MASK test_cfg.replace_dilate=${DILATE:-15} test_cfg.replace_mask_mode=${MASK_MODE:-dilate} \
-test_cfg.replace_fill=${FILL:-grey} test_cfg.replace_grow=${GROW:-5} \
+test_cfg.replace_fill=${FILL:-grey} test_cfg.replace_grow=${GROW:-5} test_cfg.replace_border=${BORDER:-32} \
 test_cfg.dit_shard_dtype=bf16 test_cfg.log_gpu_memory=true $BG_OVERRIDE ${EXTRA_OVERRIDES:-}"
 exec bash scripts/run_v100.sh

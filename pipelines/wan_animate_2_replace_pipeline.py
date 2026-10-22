@@ -5,7 +5,8 @@ inference_core (pipelines/wan_animate_2_pipeline.py) with three marked changes (
 so keep the copy in step if that function changes:
 
   1. one person mask per driving frame (scripts/make_person_mask.py), dilated by test_cfg.replace_dilate px
-     (or its per-frame bounding box with test_cfg.replace_mask_mode=bbox);
+     (or its per-frame bounding box with test_cfg.replace_mask_mode=bbox, or the whole frame minus a
+     test_cfg.replace_border px strip of the real video with replace_mask_mode=frame);
   2. the continuation conditioning y carries the driving frames with the person region filled grey
      (test_cfg.replace_fill=grey|blur|black), and its mask channels become per-pixel: 1 = keep (background,
      previous-clip frames), 0 = generate (person region, grown by test_cfg.replace_grow latent cells).
@@ -44,11 +45,17 @@ def load_person_masks(cfg, idxs, area, target_len):
         raise ValueError(f"{path} has {len(masks)} masks but frame {max(idxs)} of the driving video is used")
     dilate = int(cfg.test_cfg.get("replace_dilate", 15))
     mode = str(cfg.test_cfg.get("replace_mask_mode", "dilate"))
+    border = int(cfg.test_cfg.get("replace_border", 32))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1)) if dilate > 0 else None
     out = []
     for m in masks[np.asarray(idxs)]:
         m3 = np.repeat(((m > 127) * 255).astype(np.uint8)[..., None], 3, axis=2)
         m = resize_by_area(m3, area, divisor=16)[..., 0] > 127  # same geometry as the driving frames
+        if mode == "frame":  # whole frame generated except a `border` px strip of the real video (scene anchor)
+            m = np.zeros_like(m)
+            m[border:m.shape[0] - border, border:m.shape[1] - border] = True
+            out.append(m.astype(np.uint8))
+            continue
         if mode == "bbox" and m.any():
             ys, xs = np.nonzero(m)
             m = np.zeros_like(m)

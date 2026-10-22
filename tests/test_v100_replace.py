@@ -142,6 +142,14 @@ def test_composite_keeps_background_outside_the_hole(masks_npz):
     assert np.array_equal(rp.composite_clip(out, bgs, pm, 0, _cfg(replace_composite=False)), out)
 
 
+def test_frame_mode_generates_everything_but_a_border(masks_npz):
+    pm = rp.load_person_masks(_cfg(replace_mask=masks_npz, replace_mask_mode="frame", replace_border=8),
+                              list(range(N)), AREA, 13)
+    m = pm[0]
+    assert m[8:-8, 8:-8].all() and not m[:8].any() and not m[-8:].any() and not m[:, :8].any()
+    assert all(np.array_equal(x, m) for x in pm)          # the person's position plays no part
+
+
 def test_feather_band_scales_with_the_object():
     def blend(h, w, box):
         mask = np.zeros((h, w), np.uint8)

@@ -364,7 +364,9 @@ CKPT_DIR=<ckpts> DRIVE=<video> REF_IMG=<image> PROMPT_FILE=<prompt.txt> TARGET=p
 **Known limits (first runs):**
 
 * **A silhouette hole leaks shape.** The character is forced into the original person's outline; a
-  `MASK_MODE=bbox` hole leaves room. Wan-Animate v1 also defaults to a box-like mask.
+  `MASK_MODE=bbox` hole leaves room. Wan-Animate v1 also defaults to a box-like mask. The extreme,
+  `MASK_MODE=frame GROW=0`, generates the whole frame except a `BORDER` px strip of the real video
+  (experimental: close to move mode, with the real scene as the anchor).
 * **The prompt's background must describe the real scene, and so must the reference image's.** The
   reference slot is copied too: a white studio backdrop in the reference reappeared inside a box-shaped
   hole even with a stage prompt. `SCENE_REF=1` puts the character on the video's own background first.
