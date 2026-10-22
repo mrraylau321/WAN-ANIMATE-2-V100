@@ -334,9 +334,9 @@ How to read the labels:
 **Hypothesis.** The generation input is 16 noise + 4 mask + 16 conditioning-latent channels. The 4 mask
 channels are per pixel by construction (one value per latent cell and frame, 4 frames packed per latent
 frame); the released inference only ever uses whole-frame patterns (reference slot and overlap frame known,
-everything else generated). Replace mode puts the **original frames with the person region filled** (with
-the surrounding background colours, `FILL=blur`) into the conditioning latent and marks **background = 1
-(keep), person region = 0 (generate)**. Generation then
+everything else generated). Replace mode puts the **original frames with the person region filled grey**
+into the conditioning latent and marks **background = 1 (keep), person region = 0 (generate)**, plus a
+ring of `GROW` latent cells around it. Generation then
 becomes inpainting of that region. Identity still comes from the reference slot + CLIP, and motion still
 comes from the driving branch, which is the same video, so the motion lands where the person was. This is
 the same mechanism as Wan-Animate v1's replace path (`wan/animate.py` in Wan2.2: background video + `1 −
@@ -376,11 +376,12 @@ CKPT_DIR=<ckpts> DRIVE=<video> REF_IMG=<image> PROMPT_FILE=<prompt.txt> TARGET=p
 * **Quality is well below move mode.** On the same inputs (a blackbird clip, an American robin reference,
   same prompt and seed) move mode drew a detailed robin, while replace mode drew a flat, washed-out shape
   in the blackbird's outline; on the dark demo stage the raw output also had a light rim along the hole.
-  Suspected causes: the old grey hole fill leaking through the VAE's receptive field into the kept cells next
-  to the hole, and per-pixel partial masks being out of distribution for these weights. `FILL=blur` (hole =
-  surrounding background colours) and `GROW=1` (one more latent cell around the hole is generated) are the
-  defaults now and target the rim; they are not yet validated on GPU. `FILL=grey GROW=0` restores the old
-  behaviour.
+  What the bird runs showed: (1) only a grey hole is drawn into; any other fill is copied as if known (a
+  grass-coloured fill gave a flat green bird); (2) the VAE's receptive field mixes the grey into the kept
+  cells next to the hole, which leaves a light rim and a flat fill, so `GROW` latent cells around the hole
+  are generated too: detail rose with it (2 < 3 < 5; default 5); (3) the character always takes the hole's
+  shape, and a bigger grey hole (`DILATE=60`) is filled entirely with character texture, not background.
+  `FILL=grey GROW=0` restores the first behaviour.
 * **No relighting.** v1 has a dedicated relighting LoRA (and fills the hole with black, `FILL=black`).
 * **Cost.** Same DiT work as move mode, plus one mask pass and seconds of CPU blending.
 

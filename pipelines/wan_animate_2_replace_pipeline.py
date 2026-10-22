@@ -6,10 +6,9 @@ so keep the copy in step if that function changes:
 
   1. one person mask per driving frame (scripts/make_person_mask.py), dilated by test_cfg.replace_dilate px
      (or its per-frame bounding box with test_cfg.replace_mask_mode=bbox);
-  2. the continuation conditioning y carries the driving frames with the person region filled with the
-     surrounding background colours (test_cfg.replace_fill=blur|grey|black), and its mask channels become
-     per-pixel: 1 = keep (background, previous-clip frames), 0 = generate (person region, grown by
-     test_cfg.replace_grow latent cells).
+  2. the continuation conditioning y carries the driving frames with the person region filled grey
+     (test_cfg.replace_fill=grey|blur|black), and its mask channels become per-pixel: 1 = keep (background,
+     previous-clip frames), 0 = generate (person region, grown by test_cfg.replace_grow latent cells).
      The public weights were trained with whole-frame masks only, so this input is out of distribution;
   3. the generated frames are pasted back onto the original background with a feathered mask
      (results.mp4); the unblended model output is saved as results_raw.mp4.
@@ -73,7 +72,7 @@ def load_background_frames(cfg, idxs, area, target_len, n_frames):
     return zigzag_padding([resize_by_area(f, area, divisor=16) for f in frames], target_len)
 
 
-def fill_hole(cond, m, fill="blur", scale=8):
+def fill_hole(cond, m, fill="grey", scale=8):
     """cond 3,n,H,W in [-1, 1]; m n,H,W (1 = hole). Returns cond with the hole filled (grey | black | blur).
     blur: normalized convolution of the known pixels at 1/scale resolution, widened until every hole pixel
     has known neighbours (the hole gets the surrounding background colours, no foreign colour)."""
@@ -107,15 +106,17 @@ def fill_hole(cond, m, fill="blur", scale=8):
 
 
 def replace_conditioning(vae, batch, clip_bg, clip_masks, mask_reft_len, H, W, lat_t, lat_h, lat_w, prec, device,
-                         fill="blur", grow=1):
+                         fill="grey", grow=5):
     """(y_reft, msk_reft) for one clip: VAE latents of the background frames with the person region filled
     and the matching per-pixel mask channels (same shapes as the move-mode tensors they replace).
 
-    fill: what goes into the hole before VAE encoding. "grey" (0, like move mode's unknown frames) leaks
-    into the neighbouring KEPT latent cells through the VAE's receptive field and shows up as a light rim
-    on dark scenes; "blur" (default) uses the surrounding background colours instead; "black" = v1.
-    grow: extra latent cells (8 px each) around the hole that are generated instead of kept, so the
-    cells that saw the fill are redrawn by the model."""
+    fill: what goes into the hole before VAE encoding. "grey" (default; 0, like move mode's unknown frames)
+    is the only content the model treats as "draw here": "blur" (surrounding colours) and "black" are
+    copied as if known (a grass-coloured fill came out as a flat green bird).
+    grow: extra latent cells (8 px each) around the hole that are generated instead of kept. The VAE's
+    receptive field mixes the grey into the cells next to the hole; keeping them leaves a light rim and a
+    flat fill. Detail rose with grow (2 < 3 < 5 on the bird test); the extra cells keep the real background
+    in y, are copied (over-saturated in results_raw.mp4) and are not pasted back."""
     n = batch["conditioning_pixel_values"].shape[2]
     cond = torch.from_numpy(np.stack(clip_bg[:n]).astype(np.float32) / 127.5 - 1).permute(3, 0, 1, 2)
     cond = F.interpolate(cond, size=(H, W), mode="bicubic")                # 3, n, H, W in [-1, 1]
@@ -150,16 +151,25 @@ def composite_clip(out, bg_images, person_masks, start, cfg):
     return np.stack(res)
 
 
-def feather_blend(fg, bg, mask, border=15):
-    """fg inside mask (0/255), bg outside, with an eroded + blurred edge. Same recipe as the unused
-    upstream blend_layer_with_mask (pipelines/utils/multiclip_utils.py), which lacks its cv2 import."""
+def feather_blend(fg, bg, mask, border=None):
+    """fg inside mask (0/255), bg outside, with an eroded + blurred edge (recipe of the unused upstream
+    blend_layer_with_mask, pipelines/utils/multiclip_utils.py, which lacks its cv2 import). The model fills
+    the whole hole, so the edge band is scaled to the object: ~4 % of its smaller side, 3..15 px. A fixed
+    15 px band faded the outer rim of small subjects (a bird ~60 px tall) into the background."""
     m = mask.astype(np.uint8).copy()
+    if border is None:
+        ys, xs = np.nonzero(m)
+        side = min(ys.max() - ys.min() + 1, xs.max() - xs.min() + 1) if len(ys) else 0
+        border = int(np.clip(round(0.04 * side), 2, 15)) | 1  # odd: even kernels shift the band by 1 px
     border = min(border, m.shape[0] // 10, m.shape[1] // 10)
     if border < 1:
         w = (m > 0).astype(np.float32)[..., None]
     else:
         m[:, :1] = 0; m[:1, :] = 0; m[-1:, :] = 0; m[:, -1:] = 0  # keep erode effective at the borders
-        m = cv2.erode(m, np.ones((border, border), np.uint8))
+        # erode half the band (nothing leaks outside the hole) + 2 px: the model draws a thin bright
+        # contour right on the hole edge, which must not be pasted
+        e = 2 * (border // 2 + 2) + 1
+        m = cv2.erode(m, np.ones((e, e), np.uint8))
         w = cv2.blur(m, (border, border)).astype(np.float32)[..., None] / 255
     return (fg * w + bg * (1 - w)).astype(np.uint8)
 
@@ -356,8 +366,8 @@ def inference_core_replace(item, gpu, cfg, clip, vae, model, t5, use_t5, context
             y_reft, msk_reft = replace_conditioning(vae, batch, bg_images[start:start + CLIP_LEN],
                                                     person_masks[start:start + CLIP_LEN],
                                                     mask_reft_len, H, W, lat_t, lat_h, lat_w, prec, device,
-                                                    fill=str(cfg.test_cfg.get("replace_fill", "blur")),
-                                                    grow=int(cfg.test_cfg.get("replace_grow", 1)))
+                                                    fill=str(cfg.test_cfg.get("replace_fill", "grey")),
+                                                    grow=int(cfg.test_cfg.get("replace_grow", 5)))
             y_reft = torch.concat([msk_reft, y_reft]).to(dtype=prec.dit, device=device)
             y = torch.concat([y_ref, y_reft], dim=1)
             debug_dump("y", y, idex, gpu)

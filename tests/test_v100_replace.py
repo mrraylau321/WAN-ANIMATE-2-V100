@@ -142,6 +142,19 @@ def test_composite_keeps_background_outside_the_hole(masks_npz):
     assert np.array_equal(rp.composite_clip(out, bgs, pm, 0, _cfg(replace_composite=False)), out)
 
 
+def test_feather_band_scales_with_the_object():
+    def blend(h, w, box):
+        mask = np.zeros((h, w), np.uint8)
+        y0, x0, y1, x1 = box
+        mask[y0:y1, x0:x1] = 255
+        fg, bg = np.full((h, w, 3), 200, np.uint8), np.zeros((h, w, 3), np.uint8)
+        return rp.feather_blend(fg, bg, mask)[..., 0].astype(int)
+    small = blend(464, 824, (200, 300, 260, 500))          # a 60 px tall bird: 3 px band, 2 px contour skipped
+    assert small[201, 400] < 100 and small[205, 400] >= 190 and small[230, 305] >= 190 and small[199, 400] == 0
+    big = blend(832, 464, (100, 100, 700, 400))            # a dancer: the band is capped at 15 px
+    assert big[400, 103] < 120 and big[400, 120] >= 190 and big[95, 250] == 0
+
+
 def test_background_video_is_sampled_like_the_driving_frames(monkeypatch):
     class Reader:
         def __init__(self, path):
