@@ -359,3 +359,19 @@ def test_cover_crops_to_the_exact_size():
     g = _gsam2()
     out = g["cover"](np.zeros((100, 300, 3), np.uint8), 64, 128)
     assert out.shape == (128, 64, 3)
+
+
+def test_px_canvas_keeps_the_normal_480p_picture():
+    """Ray's layout: bigger canvas, the original frame at exactly its plain-480p size, ~8 px border outside."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import pad_replace
+    h, w = 1920, 1080
+    assert pad_replace.content_size(h, w, 480 * 832) == (824, 464)          # a plain 480p run
+    p, canvas = pad_replace.fit_canvas(h, w, 8, "480x832")
+    cw, ch = map(int, canvas.split("x"))
+    assert (p, canvas) == (19, "480x856") and cw * ch > 480 * 832
+    ph, pw = h + 2 * p, w + 2 * p
+    oh, ow = pad_replace.content_size(ph, pw, cw * ch)                       # the pipeline's raw output
+    meta = {"pad": p, "height": h, "width": w, "padded_height": ph, "padded_width": pw}
+    y0, x0, y1, x1 = pad_replace.crop_box(meta, oh, ow)
+    assert (y1 - y0, x1 - x0) == (824, 464) and (y0, x0) == (8, 8)

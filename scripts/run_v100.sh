@@ -6,7 +6,7 @@
 # GPU (upstream design). Do NOT use `torchrun --nproc_per_node=8` (that would create 8x8 ranks).
 #
 # Environment knobs (defaults in brackets):
-#   MODE       base|distill [base]          RES   480p|540p|720p [480p] (portrait, like the example)
+#   MODE       base|distill [base]          RES   480p|540p|720p|<W>x<H> [480p] (portrait, like the example)
 #   CKPT_DIR   [<repo>/ckpts]  layout of `huggingface-cli download Wan-AI/Wan2.2-Animate-2-14B --local-dir ckpts`
 #   REF_IMG    [<repo>/examples/demo1/reference.png]   DRIVE [<repo>/examples/demo1/template.mp4]
 #   PROMPT     caption of REF_IMG in the README's 人物外观描述/背景描述 format
@@ -43,7 +43,8 @@ case "${RES:-480p}" in
   480p) W=480; H=832 ;;
   540p) W=544; H=960 ;;
   720p) W=720; H=1280 ;;
-  *) echo "RES must be 256x448|288x512|480p|540p|720p" >&2; exit 2 ;;
+  [0-9]*x[0-9]*) W=${RES%x*}; H=${RES#*x} ;;  # any WxH (only the area counts), e.g. pad_replace.py --px canvas
+  *) echo "RES must be 256x448|288x512|480p|540p|720p|<W>x<H>" >&2; exit 2 ;;
 esac
 
 WAN=$CKPT_DIR/videomodel/Wan-AI
