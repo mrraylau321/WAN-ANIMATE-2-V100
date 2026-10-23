@@ -161,14 +161,15 @@ def test_pad_then_crop_returns_the_original_framing(tmp_path):
     src = str(tmp_path / "drive.mp4")
     pad_replace.write_video(src, frames, 10)
     prefix = str(tmp_path / "drive_pad")
-    sys.argv = ["pad_replace.py", "pad", "--video", src, "--frac", "0.1", "--out-prefix", prefix]
+    sys.argv = ["pad_replace.py", "pad", "--video", src, "--frac", "0.1", "--margin", "0.05", "--out-prefix", prefix]
     pad_replace.main()
     meta = __import__("json").load(open(prefix + ".json"))
     p = meta["pad"]
     assert p == 6 and (meta["padded_height"], meta["padded_width"]) == (h + 2 * p, w + 2 * p)
     hole = np.load(prefix + "_hole.npz")["masks"]
-    assert hole.shape == (n, h + 2 * p, w + 2 * p) and hole[0, p:p + h, p:p + w].min() == 255
-    assert hole[0, :p].max() == 0 and hole[0, :, :p].max() == 0
+    m = meta["margin"]
+    assert m == 3 and hole.shape == (n, h + 2 * p, w + 2 * p) and hole[0, p - m:p + h + m, p - m:p + w + m].min() == 255
+    assert hole[0, :p - m].max() == 0 and hole[0, :, :p - m].max() == 0      # outer border stays known
     padded = [f for f in imageio.get_reader(prefix + ".mp4")]
     assert padded[0].shape[:2] == (h + 2 * p, w + 2 * p) and padded[0][h // 2, 2, 0] > 200   # mirrored red
     # a pipeline output is the padded frame at another size; crop must give back the original framing

@@ -1,15 +1,19 @@
 """Padding variant of the experimental replace mode: the anchor strip of real video sits OUTSIDE the output.
 
-    pad:  python scripts/pad_replace.py pad --video drive.mp4 --frac 0.05 --out-prefix inputs/drive_pad
+    pad:  python scripts/pad_replace.py pad --video drive.mp4 --frac 0.14 --margin 0.08 --out-prefix inputs/drive_pad
           -> inputs/drive_pad.mp4      the driving video with a mirrored (reflect) border on every side
-             inputs/drive_pad_hole.npz hole masks: 255 = the original frame (generated), 0 = the border (kept)
+             inputs/drive_pad_hole.npz hole masks: 255 = generated (the original frame plus `margin` of the
+                                       border), 0 = the outer border (kept, the scene anchor)
              inputs/drive_pad.json     border size, to crop it off afterwards
     crop: python scripts/pad_replace.py crop --video results.mp4 --meta inputs/drive_pad.json
           -> results_crop.mp4          the border removed: the original framing, fully generated
 
 Run the replace pipeline on the padded video with MASK=<hole.npz> MASK_MODE=dilate DILATE=0 GROW=0, so the
-mirrored border stays known (scene anchor) and everything inside is generated; the seam between the two
-then lies in the part that is cropped off. Build a scene reference (grounded_sam2.py scene-ref) from the
+mirrored border stays known (scene anchor) and everything inside is generated. The model draws a light rim
+just inside the edge of the generated area, so that edge sits `margin` inside the border: rim and seam both
+lie in the part that is cropped off. At 480p the rim reaches ~25-28 px into the generated area, and the kept
+anchor should stay >= 16 px (one DiT token), hence the defaults (cost: ~22% less resolution per side).
+Build a scene reference (grounded_sam2.py scene-ref) from the
 ORIGINAL video first: its clean plate needs the original person masks.
 """
 import argparse
@@ -38,16 +42,20 @@ def cmd_pad(a):
     frames = [f for f in reader]
     h, w = frames[0].shape[:2]
     p = max(1, int(round(a.frac * min(h, w))))
+    m = int(round(a.margin * min(h, w)))
+    if not 0 <= m < p:
+        raise SystemExit(f"--margin must be smaller than --frac (margin {m} px, border {p} px)")
     padded = [cv2.copyMakeBorder(f, p, p, p, p, cv2.BORDER_REFLECT_101) for f in frames]
     ph, pw = padded[0].shape[:2]
     hole = np.zeros((ph // 2 * 2, pw // 2 * 2), np.uint8)
-    hole[p:p + h, p:p + w] = 255
+    hole[p - m:p + h + m, p - m:p + w + m] = 255
     write_video(a.out_prefix + ".mp4", padded, fps)
     np.savez_compressed(a.out_prefix + "_hole.npz", masks=np.repeat(hole[None], len(frames), axis=0))
-    meta = {"pad": p, "height": h, "width": w, "padded_height": ph // 2 * 2, "padded_width": pw // 2 * 2}
+    meta = {"pad": p, "margin": m, "height": h, "width": w, "padded_height": ph // 2 * 2, "padded_width": pw // 2 * 2}
     with open(a.out_prefix + ".json", "w") as fh:
         json.dump(meta, fh)
-    print(f"{len(frames)} frames {w}x{h} -> {meta['padded_width']}x{meta['padded_height']} (border {p} px)\n"
+    print(f"{len(frames)} frames {w}x{h} -> {meta['padded_width']}x{meta['padded_height']} "
+          f"(border {p} px, of which {m} px generated)\n"
           f"  -> {a.out_prefix}.mp4, {a.out_prefix}_hole.npz, {a.out_prefix}.json")
 
 
@@ -75,7 +83,9 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("pad")
     s.add_argument("--video", required=True)
-    s.add_argument("--frac", type=float, default=0.05, help="border per side, as a fraction of the shorter side")
+    s.add_argument("--frac", type=float, default=0.14, help="border per side, as a fraction of the shorter side")
+    s.add_argument("--margin", type=float, default=0.08,
+                   help="part of the border that is generated too (the rim lands there and is cropped off)")
     s.add_argument("--out-prefix", required=True)
     s = sub.add_parser("crop")
     s.add_argument("--video", required=True)
