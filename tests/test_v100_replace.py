@@ -150,6 +150,36 @@ def test_frame_mode_generates_everything_but_a_border(masks_npz):
     assert all(np.array_equal(x, m) for x in pm)          # the person's position plays no part
 
 
+def test_pad_then_crop_returns_the_original_framing(tmp_path):
+    import imageio.v2 as imageio
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import pad_replace
+    h, w, n = 96, 64, 5
+    frames = [np.full((h, w, 3), 40 * k, np.uint8) for k in range(n)]
+    for f in frames:
+        f[:, : w // 2, 0] = 250                                   # left half red: the mirror must keep it
+    src = str(tmp_path / "drive.mp4")
+    pad_replace.write_video(src, frames, 10)
+    prefix = str(tmp_path / "drive_pad")
+    sys.argv = ["pad_replace.py", "pad", "--video", src, "--frac", "0.1", "--out-prefix", prefix]
+    pad_replace.main()
+    meta = __import__("json").load(open(prefix + ".json"))
+    p = meta["pad"]
+    assert p == 6 and (meta["padded_height"], meta["padded_width"]) == (h + 2 * p, w + 2 * p)
+    hole = np.load(prefix + "_hole.npz")["masks"]
+    assert hole.shape == (n, h + 2 * p, w + 2 * p) and hole[0, p:p + h, p:p + w].min() == 255
+    assert hole[0, :p].max() == 0 and hole[0, :, :p].max() == 0
+    padded = [f for f in imageio.get_reader(prefix + ".mp4")]
+    assert padded[0].shape[:2] == (h + 2 * p, w + 2 * p) and padded[0][h // 2, 2, 0] > 200   # mirrored red
+    # a pipeline output is the padded frame at another size; crop must give back the original framing
+    out = str(tmp_path / "results.mp4")
+    pad_replace.write_video(out, [cv2.resize(f, (2 * (w + 2 * p), 2 * (h + 2 * p))) for f in padded], 10)
+    sys.argv = ["pad_replace.py", "crop", "--video", out, "--meta", prefix + ".json"]
+    pad_replace.main()
+    cropped = [f for f in imageio.get_reader(str(tmp_path / "results_crop.mp4"))]
+    assert cropped[0].shape[:2] == (2 * h, 2 * w) and len(cropped) == n
+
+
 def test_feather_band_scales_with_the_object():
     def blend(h, w, box):
         mask = np.zeros((h, w), np.uint8)
