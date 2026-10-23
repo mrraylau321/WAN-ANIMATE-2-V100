@@ -375,3 +375,19 @@ def test_px_canvas_keeps_the_normal_480p_picture():
     meta = {"pad": p, "height": h, "width": w, "padded_height": ph, "padded_width": pw}
     y0, x0, y1, x1 = pad_replace.crop_box(meta, oh, ow)
     assert (y1 - y0, x1 - x0) == (824, 464) and (y0, x0) == (8, 8)
+
+
+def test_pad_image_frames_the_reference_like_the_video(tmp_path):
+    """The pipeline crops with the reference's framing: a padded reference must give the padded video's canvas."""
+    sys.path.insert(0, os.path.join(REPO, "scripts"))
+    import pad_replace
+    h, w = 192, 108
+    src, ref, prefix = str(tmp_path / "d.mp4"), str(tmp_path / "r.png"), str(tmp_path / "d_canvas")
+    pad_replace.write_video(src, [np.full((h, w, 3), 90, np.uint8)] * 3, 10)
+    cv2.imwrite(ref, np.full((2 * h, 2 * w, 3), 50, np.uint8))
+    sys.argv = ["pad_replace.py", "pad", "--video", src, "--px", "8", "--res", "96x160", "--image", ref,
+                "--out-prefix", prefix]
+    pad_replace.main()
+    meta = __import__("json").load(open(prefix + ".json"))
+    padded_ref = cv2.imread(prefix + "_ref.png")
+    assert padded_ref.shape[:2] == (2 * meta["padded_height"], 2 * meta["padded_width"])

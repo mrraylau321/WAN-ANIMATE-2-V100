@@ -20,6 +20,10 @@ ORIGINAL video first: its clean plate needs the original person masks.
 pixels per side and the original frame keeps exactly its normal size at that resolution (the 1080x1920
 clip: 464x824 inside, same as a plain 480p run). The json then holds `canvas` (e.g. 480x856): run the
 pipeline with RES=<canvas>, so the edge of the generated area sits on the edge of the normal 480p picture.
+
+--image REF pads the reference image the same way (-> <out-prefix>_ref.png). Use it: the pipeline crops
+its output with the REFERENCE image's framing, and the model draws the scene at the reference's framing,
+so an unpadded reference shifts the picture by the border and breaks the crop.
 """
 import argparse
 import json
@@ -83,6 +87,12 @@ def cmd_pad(a):
     hole = np.zeros((ph // 2 * 2, pw // 2 * 2), np.uint8)
     hole[p - m:p + h + m, p - m:p + w + m] = 255
     write_video(a.out_prefix + ".mp4", padded, fps)
+    if a.image:
+        ref = cv2.imread(a.image)
+        if abs(ref.shape[1] / ref.shape[0] - w / h) > 0.01:
+            print(f"warning: {a.image} is not shaped like the video; its padded framing will differ")
+        q = max(1, int(round(p * ref.shape[1] / w)))
+        cv2.imwrite(a.out_prefix + "_ref.png", cv2.copyMakeBorder(ref, q, q, q, q, cv2.BORDER_REFLECT_101))
     np.savez_compressed(a.out_prefix + "_hole.npz", masks=np.repeat(hole[None], len(frames), axis=0))
     meta = {"pad": p, "margin": m, "height": h, "width": w, "padded_height": ph // 2 * 2, "padded_width": pw // 2 * 2,
             "canvas": canvas}
@@ -90,7 +100,8 @@ def cmd_pad(a):
         json.dump(meta, fh)
     print(f"{len(frames)} frames {w}x{h} -> {meta['padded_width']}x{meta['padded_height']} "
           f"(border {p} px, of which {m} px generated)" + (f", run with RES={canvas}" if canvas else "") + "\n"
-          f"  -> {a.out_prefix}.mp4, {a.out_prefix}_hole.npz, {a.out_prefix}.json")
+          f"  -> {a.out_prefix}.mp4, {a.out_prefix}_hole.npz, {a.out_prefix}.json"
+          + (f", {a.out_prefix}_ref.png" if a.image else ""))
 
 
 def crop_box(meta, out_h, out_w):
@@ -106,7 +117,11 @@ def cmd_crop(a):
     reader = imageio.get_reader(a.video)
     fps = reader.get_meta_data()["fps"]
     frames = [f for f in reader]
-    y0, x0, y1, x1 = crop_box(meta, *frames[0].shape[:2])
+    oh, ow = frames[0].shape[:2]
+    if abs(ow / oh - meta["padded_width"] / meta["padded_height"]) > 0.005:
+        print(f"warning: output {ow}x{oh} is not framed like the padded video: the reference image was not "
+              f"padded (pad --image), so this crop is off")
+    y0, x0, y1, x1 = crop_box(meta, oh, ow)
     out = a.out or os.path.splitext(a.video)[0] + "_crop.mp4"
     write_video(out, [f[y0:y1, x0:x1] for f in frames], fps, crf=16)
     print(f"cropped {frames[0].shape[1]}x{frames[0].shape[0]} -> {x1 - x0}x{y1 - y0}: {out}")
@@ -123,6 +138,7 @@ def main():
     s.add_argument("--px", type=int, default=0,
                    help="border in output pixels per side on a bigger canvas (replaces --frac; see above)")
     s.add_argument("--res", default="480x832", help="the normal resolution the original frame keeps (--px)")
+    s.add_argument("--image", help="reference image to pad the same way (-> <out-prefix>_ref.png)")
     s.add_argument("--out-prefix", required=True)
     s = sub.add_parser("crop")
     s.add_argument("--video", required=True)
