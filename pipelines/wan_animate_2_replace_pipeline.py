@@ -573,6 +573,7 @@ def inference_core_replace(item, gpu, cfg, clip, vae, model, t5, use_t5, context
         all_out_frames_array = all_out_frames_array[:real_frame_len]
 
         padding_type, padding, side_long = pading_info['padding_type'], pading_info['padding'], pading_info['side_long']
+        side_long = side_long // 2 * 2  # even size: odd sizes are written as yuv444 (most players cannot open it)
         if padding_type == 'width':
             all_out_frames_array = all_out_frames_array[:, :, padding:padding+side_long, :]
         else:
