@@ -69,6 +69,8 @@ class Detector:
         boxes, scores = self.boxes(img, target)
         if not len(boxes):
             return None
+        if pick == "union":  # several phrases ("cat. clothes") -> one box around all: the whole figure
+            return [float(boxes[:, 0].min()), float(boxes[:, 1].min()), float(boxes[:, 2].max()), float(boxes[:, 3].max())]
         key = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]) if pick == "largest" else scores
         return boxes[int(np.argmax(key))].tolist()
 
@@ -227,8 +229,9 @@ def main():
         s.add_argument("--sam2", default="facebook/sam2.1-hiera-large", help="HF id or local dir")
         s.add_argument("--box-threshold", type=float, default=0.35)
         s.add_argument("--text-threshold", type=float, default=0.25)
-        s.add_argument("--pick", choices=["largest", "score"], default="largest",
-                       help="which detection to follow when several match")
+        s.add_argument("--pick", choices=["largest", "score", "union"], default="largest",
+                       help="which detection to follow when several match (union: one box around all of them, "
+                            "e.g. --ref-target 'cat. clothes' for a dressed character)")
         s.add_argument("--max-side", type=int, default=1024, help="frames are processed at this size")
         s.add_argument("--video", required=True)
         s.add_argument("--out")

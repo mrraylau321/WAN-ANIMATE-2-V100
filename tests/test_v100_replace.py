@@ -428,3 +428,12 @@ def test_blend_pins_the_background_to_the_driving_latents():
     assert torch.allclose(latents[0][:, 1:][bg], z[bg], atol=1e-4)
     assert torch.allclose(latents[0][:, 1:][fg], a[:, 1:][fg], atol=1e-4)
     assert torch.allclose(latents[0][:, :1], a[:, :1], atol=1e-4)          # the reference slot is untouched
+
+
+def test_detector_union_pick_boxes_the_whole_dressed_character():
+    """'cat. clothes' with --pick union: one box around the head AND the uniform (largest alone = head only)."""
+    g = _gsam2()
+    det = object.__new__(g["Detector"])
+    det.boxes = lambda img, target: (np.array([[100., 50., 300., 250.], [80., 220., 320., 600.]]), np.array([.6, .5]))
+    assert det.best(None, "cat. clothes", "union") == [80., 50., 320., 600.]
+    assert det.best(None, "cat. clothes", "largest") == [80., 220., 320., 600.]
