@@ -392,3 +392,39 @@ def test_pad_image_frames_the_reference_like_the_video(tmp_path):
     padded_ref = cv2.imread(prefix + "_ref.png")
     assert padded_ref.shape[:2] == (2 * meta["padded_height"], 2 * meta["padded_width"])
     assert padded_ref[0, 0].max() == 0 and padded_ref[meta["pad"] * 2 + 1, meta["pad"] * 2 + 1].min() == 50
+
+
+def test_blend_mask_groups_frames_like_the_vae():
+    """Latent frame 0 = pixel frame 0, latent frame k covers pixel frames 4k-3..4k; 1 = background (pinned)."""
+    import pipelines.wan_animate_2_blend_pipeline as bp
+    cfg = EasyDict(test_cfg=EasyDict(blend_grow=0))
+    masks = [np.zeros((32, 48), np.uint8) for _ in range(9)]
+    masks[3][8:16, 16:24] = 1                                   # person only in pixel frame 3 -> latent frame 1
+    z = torch.randn(1, 16, 3, 4, 6)
+    _, keep = bp.blend_setup(cfg, z, masks, (16, 4, 4, 6), "cpu")
+    assert keep.shape == (1, 3, 4, 6)
+    assert keep[0, 1, 1, 2] == 0 and keep[0, 1].sum() == 23 and keep[0, 0].min() == 1 and keep[0, 2].min() == 1
+    assert bp.blend_setup(cfg, z, masks, (16, 5, 4, 6), "cpu") is None  # shape mismatch -> blending off
+
+
+def test_blend_pins_the_background_to_the_driving_latents():
+    """Through the real flow DPM solver: background ends exactly on the driving latents, person region free."""
+    import pipelines.wan_animate_2_blend_pipeline as bp
+    from wanxiang.utils.fm_solvers import FlowDPMSolverMultistepScheduler
+    cfg = EasyDict(test_cfg=EasyDict(blend_free_steps=0))
+    g = torch.Generator().manual_seed(0)
+    z, a = torch.randn(16, 3, 4, 6, generator=g), torch.randn(16, 4, 4, 6, generator=g)  # driving / model's x0
+    keep = torch.ones(1, 3, 4, 6)
+    keep[:, :, 1:3, 2:4] = 0                                    # the person region is generated
+    sched = FlowDPMSolverMultistepScheduler(num_train_timesteps=1000, shift=1, use_dynamic_shifting=False)
+    timesteps, _ = base.retrieve_timesteps(sched, device="cpu", sigmas=base.get_sampling_sigmas(10, 5.0))
+    latents = [torch.randn(16, 4, 4, 6, generator=g)]
+    for i, t in enumerate(timesteps):
+        sigma = sched.sigmas[i]
+        noise_pred = base.TensorList([(latents[0] - a) / float(sigma)])   # a model that wants x0 = a
+        noise_pred = bp.blend_velocity(noise_pred, latents, (z, keep), sigma, i, len(timesteps), cfg)
+        latents[0] = sched.step(noise_pred[0][None], t, latents[0][None], return_dict=False)[0][0]
+    bg, fg = keep[0].bool().expand(16, -1, -1, -1), ~keep[0].bool().expand(16, -1, -1, -1)
+    assert torch.allclose(latents[0][:, 1:][bg], z[bg], atol=1e-4)
+    assert torch.allclose(latents[0][:, 1:][fg], a[:, 1:][fg], atol=1e-4)
+    assert torch.allclose(latents[0][:, :1], a[:, :1], atol=1e-4)          # the reference slot is untouched
