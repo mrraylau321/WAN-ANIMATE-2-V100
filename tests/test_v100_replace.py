@@ -386,8 +386,9 @@ def test_pad_image_frames_the_reference_like_the_video(tmp_path):
     pad_replace.write_video(src, [np.full((h, w, 3), 90, np.uint8)] * 3, 10)
     cv2.imwrite(ref, np.full((2 * h, 2 * w, 3), 50, np.uint8))
     sys.argv = ["pad_replace.py", "pad", "--video", src, "--px", "8", "--res", "96x160", "--image", ref,
-                "--out-prefix", prefix]
+                "--border", "black", "--out-prefix", prefix]
     pad_replace.main()
     meta = __import__("json").load(open(prefix + ".json"))
     padded_ref = cv2.imread(prefix + "_ref.png")
     assert padded_ref.shape[:2] == (2 * meta["padded_height"], 2 * meta["padded_width"])
+    assert padded_ref[0, 0].max() == 0 and padded_ref[meta["pad"] * 2 + 1, meta["pad"] * 2 + 1].min() == 50

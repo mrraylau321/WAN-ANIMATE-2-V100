@@ -82,7 +82,8 @@ def cmd_pad(a):
     m = int(round((a.margin if a.margin is not None else 0 if a.px else 0.08) * min(h, w)))
     if not 0 <= m < p:
         raise SystemExit(f"--margin must be smaller than --frac (margin {m} px, border {p} px)")
-    padded = [cv2.copyMakeBorder(f, p, p, p, p, cv2.BORDER_REFLECT_101) for f in frames]
+    border = cv2.BORDER_CONSTANT if a.border == "black" else cv2.BORDER_REFLECT_101
+    padded = [cv2.copyMakeBorder(f, p, p, p, p, border, value=0) for f in frames]
     ph, pw = padded[0].shape[:2]
     hole = np.zeros((ph // 2 * 2, pw // 2 * 2), np.uint8)
     hole[p - m:p + h + m, p - m:p + w + m] = 255
@@ -92,7 +93,7 @@ def cmd_pad(a):
         if abs(ref.shape[1] / ref.shape[0] - w / h) > 0.01:
             print(f"warning: {a.image} is not shaped like the video; its padded framing will differ")
         q = max(1, int(round(p * ref.shape[1] / w)))
-        cv2.imwrite(a.out_prefix + "_ref.png", cv2.copyMakeBorder(ref, q, q, q, q, cv2.BORDER_REFLECT_101))
+        cv2.imwrite(a.out_prefix + "_ref.png", cv2.copyMakeBorder(ref, q, q, q, q, border, value=0))
     np.savez_compressed(a.out_prefix + "_hole.npz", masks=np.repeat(hole[None], len(frames), axis=0))
     meta = {"pad": p, "margin": m, "height": h, "width": w, "padded_height": ph // 2 * 2, "padded_width": pw // 2 * 2,
             "canvas": canvas}
@@ -139,6 +140,7 @@ def main():
                    help="border in output pixels per side on a bigger canvas (replaces --frac; see above)")
     s.add_argument("--res", default="480x832", help="the normal resolution the original frame keeps (--px)")
     s.add_argument("--image", help="reference image to pad the same way (-> <out-prefix>_ref.png)")
+    s.add_argument("--border", choices=["mirror", "black"], default="mirror", help="what the border holds")
     s.add_argument("--out-prefix", required=True)
     s = sub.add_parser("crop")
     s.add_argument("--video", required=True)
