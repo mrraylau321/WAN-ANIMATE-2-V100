@@ -1,0 +1,112 @@
+"""scripts/ti2v5b_replace.py on tiny random Wan2.2-shaped models (diffusers): geometry, TI2V first frame, pinning."""
+import os
+import sys
+import types
+
+import numpy as np
+import pytest
+import torch
+
+from conftest import REPO
+
+pytest.importorskip("diffusers")
+sys.path.insert(0, os.path.join(REPO, "scripts"))
+import ti2v5b_replace as tr  # noqa: E402
+
+
+def tiny_models():
+    from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanTransformer3DModel
+    torch.manual_seed(0)
+    vae = AutoencoderKLWan(base_dim=16, decoder_base_dim=16, z_dim=48, dim_mult=[1, 2, 4, 4], num_res_blocks=1,
+                           attn_scales=[], temperal_downsample=[False, True, True], in_channels=12, out_channels=12,
+                           patch_size=2, is_residual=True, scale_factor_spatial=16, scale_factor_temporal=4,
+                           latents_mean=[0.0] * 48, latents_std=[1.0] * 48)
+    transformer = WanTransformer3DModel(patch_size=(1, 2, 2), num_attention_heads=2, attention_head_dim=8,
+                                        in_channels=48, out_channels=48, text_dim=16, freq_dim=16, ffn_dim=32,
+                                        num_layers=1, cross_attn_norm=True, qk_norm="rms_norm_across_heads")
+    # the published Wan2.2-TI2V-5B scheduler config
+    sched = UniPCMultistepScheduler(prediction_type="flow_prediction", use_flow_sigmas=True, flow_shift=5.0,
+                                    num_train_timesteps=1000, solver_order=2, predict_x0=True, final_sigmas_type="zero")
+    return vae, transformer, sched
+
+
+def test_latent_keep_groups_frames_like_the_vae():
+    masks = np.zeros((9, 64, 32), bool)
+    masks[3, 16:20, 16:20] = True                       # pixel frame 3 -> latent frame 1, cell (1, 1)
+    keep = tr.latent_keep(masks, grow=0)
+    assert keep.shape == (1, 1, 3, 4, 2)
+    assert keep[0, 0, 1, 1, 1] == 0 and keep[0, 0, 1].sum() == 7
+    assert keep[0, 0, 0].min() == 1 and keep[0, 0, 2].min() == 1
+
+
+def test_denoise_pins_the_background_and_keeps_the_first_frame():
+    _, transformer, sched = tiny_models()
+    g = torch.Generator().manual_seed(1)
+    z = torch.randn(1, 48, 3, 4, 2, generator=g)
+    cond0 = torch.randn(1, 48, 1, 4, 2, generator=g)
+    keep = torch.ones(1, 1, 3, 4, 2)
+    keep[..., 1:3, 0:1] = 0
+    ctx = torch.randn(1, 8, 16)
+    out = tr.denoise(transformer, sched, z, cond0, keep, ctx, ctx, steps=10, strength=0.8, guide=2.0, free_steps=0,
+                     generator=torch.Generator().manual_seed(2), dtype=torch.float32, log=lambda *_: None)
+    assert out.shape == z.shape and torch.isfinite(out).all()
+    assert torch.allclose(out[:, :, :1], cond0)                                  # g0 slot
+    bg = keep.bool().expand_as(z).clone()
+    bg[:, :, 0] = False
+    assert torch.allclose(out[bg], z[bg], atol=1e-4)                             # background = driving latents
+    assert not torch.allclose(out[~keep.bool().expand_as(z)], z[~keep.bool().expand_as(z)], atol=1e-2)
+
+
+def test_run_end_to_end_on_tiny_models(tmp_path):
+    import cv2
+    vae, transformer, sched = tiny_models()
+    frames = [np.full((128, 72, 3), 30 + 10 * k, np.uint8) for k in range(12)]
+    drive = str(tmp_path / "drive.mp4")
+    tr.write_video(drive, frames, 24)
+    masks = np.zeros((12, 128, 72), np.uint8)
+    masks[:, 40:90, 20:50] = 255
+    np.savez_compressed(tmp_path / "m.npz", masks=masks)
+    cv2.imwrite(str(tmp_path / "g0.png"), np.full((256, 144, 3), 200, np.uint8))
+    a = types.SimpleNamespace(drive=drive, masks=str(tmp_path / "m.npz"), g0=str(tmp_path / "g0.png"), fps=24,
+                              frames=121, width=32, height=64, dilate=3, grow=0, no_blend=False, seed=0, steps=4,
+                              strength=0.8, guide=1.0, free_steps=1, out=str(tmp_path / "out"))
+    ctx = torch.randn(1, 8, 16)
+    path = tr.run(a, transformer, vae, sched, ctx, ctx, "cpu", torch.float32, log=lambda *_: None)
+    import imageio.v2 as imageio
+    out = [f for f in imageio.get_reader(path)]
+    assert len(out) == 9 and out[0].shape == (64, 32, 3)                         # 12 frames -> 4k+1 = 9
+
+
+def test_launcher_builds_g0_then_runs_ti2v5b(tmp_path):
+    import stat
+    import subprocess
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    py = fake / "python"
+    py.write_text('#!/bin/bash\n'
+                  'if [[ "$1" == - || "$1" == -c ]]; then exec "%s" "$@"; fi\n'
+                  'if [[ "$1" == scripts/grounded_sam2.py ]]; then echo "GSAM2 $*"; '
+                  'while [[ $# -gt 0 ]]; do [[ "$1" == --out ]] && touch "$2"; shift; done; exit 0; fi\n'
+                  'if [[ "$1" == scripts/ti2v5b_replace.py ]]; then printf "ARG %%s\\n" "$@"; exit 0; fi\n'
+                  'exit 0\n' % sys.executable)
+    py.chmod(py.stat().st_mode | stat.S_IEXEC)
+    ck = tmp_path / "5b"
+    for f in ("transformer/config.json", "vae/config.json", "text_encoder/config.json",
+              "tokenizer/tokenizer_config.json", "scheduler/scheduler_config.json"):
+        (ck / f).parent.mkdir(parents=True, exist_ok=True)
+        (ck / f).write_text("{}")
+    drive, ref = tmp_path / "clip.mp4", tmp_path / "reference.png"
+    drive.write_bytes(b"")
+    ref.write_bytes(b"")
+    env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", CKPT_5B=str(ck), DRIVE=str(drive), REF_IMG=str(ref),
+               PROMPT="a cat", REF_TARGET="cat. clothes", REF_PICK="union", STRENGTH="0.7",
+               OUT_DIR=str(tmp_path / "out"), WORK_DIR=str(tmp_path / "work"))
+    p = subprocess.run(["bash", os.path.join(REPO, "scripts", "run_ti2v5b_replace.sh")], env=env,
+                       capture_output=True, text=True, timeout=120)
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, out[-2000:]
+    assert "GSAM2 scripts/grounded_sam2.py video" in out and "clip_gsam2_person_mask.npz" in out
+    assert "--pick union" in out and "--ref-target cat. clothes" in out
+    args = [line[4:] for line in out.splitlines() if line.startswith("ARG ")]
+    assert args[args.index("--g0") + 1].endswith("reference_scene_union.png")
+    assert args[args.index("--strength") + 1] == "0.7" and args[args.index("--model") + 1] == str(ck)
