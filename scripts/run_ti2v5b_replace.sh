@@ -8,8 +8,11 @@
 # Weights (34 GB): huggingface-cli download Wan-AI/Wan2.2-TI2V-5B-Diffusers --local-dir $CKPT_5B
 # Needs diffusers >= 0.35 (pip install -U 'diffusers>=0.35').
 # Optional: TARGET=person (what to replace)  REF_PICK=largest|union  GPUS=0,1 (text encoder on the 2nd GPU)
-#           STRENGTH=0.8 STEPS=40 GUIDE=5 WIDTH=480 HEIGHT=832 FRAMES=121 FPS=24 DILATE=15 GROW=1 FREE=2
+#           STRENGTH=0.6 STEPS=40 GUIDE=5 WIDTH=480 HEIGHT=832 FRAMES=121 FPS=24 DILATE=15 GROW=1 FREE=2
 #           DTYPE=fp16|fp32 SEED=42 NO_BLEND=1 OUT_DIR=~/ray_runs/ti2v5b WORK_DIR=inputs
+# Other TI2V-5B-architecture weights (CKPT_5B still gives configs, VAE, text encoder, scheduler):
+#           TRANSFORMER_CKPT=<one .pth/.safetensors>   or   EXPERTS="<file>@<lo>-<hi> <file>@<lo>-<hi> ..."
+#           (timestep ranges, t = 1000 * sigma, together covering 0-1000; one expert on the GPU at a time)
 set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO"
@@ -51,6 +54,8 @@ LOG="$OUT_DIR/ti2v5b_$(date +%Y%m%d_%H%M%S).log"
 # shellcheck disable=SC2046
 python scripts/ti2v5b_replace.py --model "$CKPT_5B" --drive "$DRIVE" --g0 "$SCENE" --masks "$MASK" \
   --prompt "${PROMPT:-}" --width "${WIDTH:-480}" --height "${HEIGHT:-832}" --frames "${FRAMES:-121}" \
-  --fps "${FPS:-24}" --steps "${STEPS:-40}" --strength "${STRENGTH:-0.8}" --guide "${GUIDE:-5}" \
+  --fps "${FPS:-24}" --steps "${STEPS:-40}" --strength "${STRENGTH:-0.6}" --guide "${GUIDE:-5}" \
   --dilate "${DILATE:-15}" --grow "${GROW:-1}" --free-steps "${FREE:-2}" --dtype "${DTYPE:-fp16}" \
-  --seed "${SEED:-42}" --out "$OUT_DIR" $([[ ${NO_BLEND:-0} == 1 ]] && echo --no-blend) 2>&1 | tee "$LOG"
+  --seed "${SEED:-42}" --out "$OUT_DIR" $([[ ${NO_BLEND:-0} == 1 ]] && echo --no-blend) \
+  ${TRANSFORMER_CKPT:+--transformer-ckpt "$TRANSFORMER_CKPT"} $(for e in ${EXPERTS:-}; do echo --expert "$e"; done) \
+  2>&1 | tee "$LOG"

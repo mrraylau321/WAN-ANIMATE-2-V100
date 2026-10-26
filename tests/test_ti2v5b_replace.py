@@ -100,6 +100,7 @@ def test_launcher_builds_g0_then_runs_ti2v5b(tmp_path):
     ref.write_bytes(b"")
     env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", CKPT_5B=str(ck), DRIVE=str(drive), REF_IMG=str(ref),
                PROMPT="a cat", REF_TARGET="cat. clothes", REF_PICK="union", STRENGTH="0.7",
+               EXPERTS=f"{tmp_path}/a.pth@500-1000 {tmp_path}/b.pth@0-500",
                OUT_DIR=str(tmp_path / "out"), WORK_DIR=str(tmp_path / "work"))
     p = subprocess.run(["bash", os.path.join(REPO, "scripts", "run_ti2v5b_replace.sh")], env=env,
                        capture_output=True, text=True, timeout=120)
@@ -110,3 +111,66 @@ def test_launcher_builds_g0_then_runs_ti2v5b(tmp_path):
     args = [line[4:] for line in out.splitlines() if line.startswith("ARG ")]
     assert args[args.index("--g0") + 1].endswith("reference_scene_union.png")
     assert args[args.index("--strength") + 1] == "0.7" and args[args.index("--model") + 1] == str(ck)
+    assert [args[i + 1] for i, x in enumerate(args) if x == "--expert"] == [f"{tmp_path}/a.pth@500-1000",
+                                                                          f"{tmp_path}/b.pth@0-500"]
+    assert "--transformer-ckpt" not in args
+
+
+def _to_original_wan_names(sd):
+    """Diffusers WanTransformer3DModel keys -> original Wan checkpoint names (TI2V subset), for the loader test."""
+    pairs = [("condition_embedder.time_embedder.linear_1", "time_embedding.0"),
+             ("condition_embedder.time_embedder.linear_2", "time_embedding.2"),
+             ("condition_embedder.text_embedder.linear_1", "text_embedding.0"),
+             ("condition_embedder.text_embedder.linear_2", "text_embedding.2"),
+             ("condition_embedder.time_proj", "time_projection.1"),
+             ("attn2", "cross_attn"), ("attn1", "self_attn"), (".to_out.0.", ".o."), (".to_q.", ".q."),
+             (".to_k.", ".k."), (".to_v.", ".v."), ("ffn.net.0.proj", "ffn.0"), ("ffn.net.2", "ffn.2"),
+             ("norm2", "norm__x"), ("norm3", "norm2"), ("norm__x", "norm3")]
+    out = {}
+    for k, v in sd.items():
+        for a, b in pairs:
+            k = k.replace(a, b)
+        if k == "scale_shift_table":
+            k = "head.modulation"
+        elif k.startswith("proj_out"):
+            k = k.replace("proj_out", "head.head")
+        k = k.replace(".scale_shift_table", ".modulation")
+        out[k] = v
+    return out
+
+
+def test_transformer_ckpt_loads_original_and_prefixed_names(tmp_path):
+    _, transformer, _ = tiny_models()
+    cfg_dir = tmp_path / "transformer"
+    transformer.save_config(cfg_dir)
+    sd = transformer.state_dict()
+    torch.save({"module." + k: v for k, v in sd.items()}, tmp_path / "prefixed.pth")
+    torch.save({"state_dict": _to_original_wan_names(sd)}, tmp_path / "original.pth")
+    for name in ("prefixed.pth", "original.pth"):
+        m = tr.load_transformer_ckpt(str(tmp_path / name), str(cfg_dir), torch.float32, log=lambda *_: None)
+        for k, v in m.state_dict().items():
+            assert torch.equal(v, sd[k]), (name, k)
+    torch.save({"blocks.0.bogus.weight": torch.zeros(1)}, tmp_path / "bad.pth")
+    with pytest.raises(SystemExit):
+        tr.load_transformer_ckpt(str(tmp_path / "bad.pth"), str(cfg_dir), torch.float32, log=lambda *_: None)
+
+
+def test_experts_switch_by_timestep_and_keep_the_pinning():
+    _, t_hi, sched = tiny_models()
+    _, t_lo, _ = tiny_models()
+    calls = {"hi": 0, "lo": 0}
+    t_hi.register_forward_hook(lambda *_: calls.__setitem__("hi", calls["hi"] + 1))
+    t_lo.register_forward_hook(lambda *_: calls.__setitem__("lo", calls["lo"] + 1))
+    experts = tr.Experts([(0, 900, t_lo), (900, 1000, t_hi)], "cpu")
+    g = torch.Generator().manual_seed(1)
+    z, cond0 = torch.randn(1, 48, 3, 4, 2, generator=g), torch.randn(1, 48, 1, 4, 2, generator=g)
+    keep = torch.ones(1, 1, 3, 4, 2)
+    keep[..., 1:3, 0:1] = 0
+    out = tr.denoise(experts, sched, z, cond0, keep, torch.randn(1, 8, 16), torch.randn(1, 8, 16), steps=10,
+                     strength=1.0, guide=1.0, free_steps=0, generator=g, dtype=torch.float32, log=lambda *_: None)
+    assert calls["hi"] > 0 and calls["lo"] > 0
+    bg = keep.bool().expand_as(z).clone()
+    bg[:, :, 0] = False
+    assert torch.allclose(out[bg], z[bg], atol=1e-4)
+    with pytest.raises(ValueError):
+        tr.Experts([(0, 500, t_lo)], "cpu")(700)

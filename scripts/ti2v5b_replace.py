@@ -11,6 +11,9 @@ first frame and text). So the motion here comes from SDEdit: the driving clip's 
 Expect: a higher --strength frees the character (less of the old person) but follows the pose less.
 
 Weights (34 GB): huggingface-cli download Wan-AI/Wan2.2-TI2V-5B-Diffusers --local-dir <dir>; needs diffusers >= 0.35.
+Other TI2V-5B-architecture weights (same VAE, text encoder and first-frame scheme): --transformer-ckpt <file> loads a
+single .pth/.safetensors (original Wan or diffusers key names) into the --model config; --expert <file>@<lo>-<hi>
+(repeatable) uses several such checkpoints by timestep range (t = 1000 * sigma, lo <= t < hi), one at a time on the GPU.
   python scripts/ti2v5b_replace.py --model <dir> --drive clip.mp4 --g0 ref_scene.png --masks clip_gsam2_person_mask.npz \\
       --prompt "..." --out outputs/ti2v5b
 """
@@ -105,6 +108,57 @@ def vae_decode(vae, z):
     return ((x[0].float().clamp(-1, 1) + 1) * 127.5).round().byte().permute(1, 2, 3, 0).cpu().numpy()
 
 
+def read_state_dict(path):
+    if path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        return load_file(path)
+    sd = torch.load(path, map_location="cpu", weights_only=True)
+    for k in ("state_dict", "model", "module", "ema"):  # common training-checkpoint wrappers
+        if isinstance(sd, dict) and k in sd and isinstance(sd[k], dict) and len(sd) <= 4:
+            sd = sd[k]
+    return sd
+
+
+def load_transformer_ckpt(path, config_dir, dtype, log=print):
+    """A WanTransformer3DModel with the config of config_dir and the weights of one checkpoint file
+    (original Wan names like blocks.0.self_attn.q.weight are converted; module./model. prefixes stripped)."""
+    from diffusers import WanTransformer3DModel
+    from diffusers.loaders.single_file_utils import convert_wan_transformer_to_diffusers
+    sd = read_state_dict(path)
+    for pre in ("module.", "model.", "_orig_mod.", "dit.", "transformer."):
+        if sd and all(k.startswith(pre) for k in sd):
+            sd = {k[len(pre):]: v for k, v in sd.items()}
+    if not any(".attn1.to_q." in k for k in sd):
+        sd = convert_wan_transformer_to_diffusers(dict(sd))
+    model = WanTransformer3DModel.from_config(WanTransformer3DModel.load_config(config_dir))
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        raise SystemExit(f"{path}: {len(missing)} missing / {len(unexpected)} unexpected keys after conversion "
+                         f"(first: {missing[:3]} {unexpected[:3]}) -> not the TI2V-5B layout")
+    log(f"loaded {path} ({sum(v.numel() for v in sd.values()) / 1e9:.2f} B params)")
+    return model.to(dtype).eval()
+
+
+class Experts:
+    """Which transformer to use at timestep t: [(lo, hi, model)], lo <= t < hi. Only the active one sits on the
+    device (the rest on the CPU), so several 5B experts fit one GPU."""
+
+    def __init__(self, ranges, device):
+        self.ranges, self.device, self.active = sorted(ranges, key=lambda r: -r[1]), device, None
+
+    def __call__(self, t):
+        t = float(t)
+        for lo, hi, m in self.ranges:
+            if lo <= t < hi or (hi >= 1000 and t >= lo):
+                if m is not self.active:
+                    if self.active is not None and len(self.ranges) > 1:
+                        self.active.to("cpu")
+                        torch.cuda.empty_cache()
+                    self.active = m.to(self.device)
+                return m
+        raise ValueError(f"no expert covers timestep {t:.1f}: {[(lo, hi) for lo, hi, _ in self.ranges]}")
+
+
 @torch.no_grad()
 def denoise(transformer, scheduler, z_drive, cond0, keep, ctx, ctx_null, steps, strength, guide, free_steps,
             generator, dtype, log=print):
@@ -122,14 +176,16 @@ def denoise(transformer, scheduler, z_drive, cond0, keep, ctx, ctx_null, steps, 
     if hasattr(scheduler, "set_begin_index"):
         scheduler.set_begin_index(k0)
     run = timesteps[k0:]
+    pick = transformer if isinstance(transformer, Experts) else (lambda _t: transformer)
     log(f"SDEdit: {len(run)} of {steps} steps from sigma {sig0:.3f} (strength {strength}); "
         f"pinned background {'off' if keep is None else f'{float(keep[:, :, 1:].mean()):.0%}'}")
     for i, t in enumerate(run):
         x_in = ((1 - ffm) * cond0 + ffm * lat).to(dtype)
         tt = (ffm[0, 0][:, ::2, ::2] * t).flatten()[None]                    # per-token timestep, first frame 0
-        v = transformer(hidden_states=x_in, timestep=tt, encoder_hidden_states=ctx, return_dict=False)[0]
+        model = pick(t)
+        v = model(hidden_states=x_in, timestep=tt, encoder_hidden_states=ctx, return_dict=False)[0]
         if guide > 1:
-            vu = transformer(hidden_states=x_in, timestep=tt, encoder_hidden_states=ctx_null, return_dict=False)[0]
+            vu = model(hidden_states=x_in, timestep=tt, encoder_hidden_states=ctx_null, return_dict=False)[0]
             v = vu + guide * (v - vu)
         v = v.float()
         if not torch.isfinite(v).all():
@@ -204,7 +260,8 @@ def main():
     p.add_argument("--frames", type=int, default=121, help="at most this many (4k+1); 121 = 5 s at 24 fps")
     p.add_argument("--fps", type=int, default=24)
     p.add_argument("--steps", type=int, default=40)
-    p.add_argument("--strength", type=float, default=0.8, help="SDEdit noise level: 1 = from pure noise")
+    p.add_argument("--strength", type=float, default=0.6,
+                   help="SDEdit noise level, 1 = pure noise (flow shift 5: 0.6 -> sigma 0.88, 0.8 -> 0.95)")
     p.add_argument("--guide", type=float, default=5.0)
     p.add_argument("--dilate", type=int, default=15, help="px around the person mask that is generated too")
     p.add_argument("--grow", type=int, default=1, help="extra latent cells (16 px) generated around it")
@@ -213,6 +270,9 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dtype", choices=["fp16", "fp32", "bf16"], default="fp16")
     p.add_argument("--t5-device", default="auto", help="auto: the 2nd GPU if there is one, else cpu")
+    p.add_argument("--transformer-ckpt", help="one checkpoint file instead of <model>/transformer")
+    p.add_argument("--expert", action="append", default=[], metavar="FILE@LO-HI",
+                   help="checkpoint used for timesteps LO <= t < HI (0..1000); repeat to cover 0-1000")
     p.add_argument("--out", default="outputs/ti2v5b")
     a = p.parse_args()
     if a.width % 32 or a.height % 32:
@@ -226,8 +286,18 @@ def main():
     ctx, ctx_null = encode_prompts(a.model, [a.prompt or " ", a.negative], t5_dev)
     vae = AutoencoderKLWan.from_pretrained(os.path.join(a.model, "vae"), torch_dtype=torch.float32).to(device)
     vae.enable_tiling()
-    transformer = WanTransformer3DModel.from_pretrained(os.path.join(a.model, "transformer"),
-                                                        torch_dtype=dtype).to(device).eval()
+    cfg_dir = os.path.join(a.model, "transformer")
+    if a.expert:
+        ranges = []
+        for spec in a.expert:
+            path, _, rng = spec.rpartition("@")
+            lo, hi = (float(x) for x in rng.split("-"))
+            ranges.append((lo, hi, load_transformer_ckpt(path, cfg_dir, dtype)))
+        transformer = Experts(ranges, device)
+    elif a.transformer_ckpt:
+        transformer = load_transformer_ckpt(a.transformer_ckpt, cfg_dir, dtype).to(device)
+    else:
+        transformer = WanTransformer3DModel.from_pretrained(cfg_dir, torch_dtype=dtype).to(device).eval()
     scheduler = UniPCMultistepScheduler.from_pretrained(os.path.join(a.model, "scheduler"))
     run(a, transformer, vae, scheduler, ctx, ctx_null, device, dtype)
 
