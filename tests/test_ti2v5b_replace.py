@@ -174,3 +174,55 @@ def test_experts_switch_by_timestep_and_keep_the_pinning():
     assert torch.allclose(out[bg], z[bg], atol=1e-4)
     with pytest.raises(ValueError):
         tr.Experts([(0, 500, t_lo)], "cpu")(700)
+
+
+def test_wan_t5_embeddings_are_padded_like_diffusers(monkeypatch):
+    calls = {}
+
+    class FakeT5:
+        def __init__(self, **kw):
+            calls.update(kw)
+
+        def __call__(self, texts):
+            return [torch.ones(3 + i, 8) for i in range(len(texts))]
+
+    mod = types.ModuleType("wanxiang.eval_i2v")
+    mod.T5Encoder = FakeT5
+    monkeypatch.setitem(sys.modules, "wanxiang.eval_i2v", mod)
+    a, b = tr.encode_prompts_wan("t5.pth", "tok", ["x", "y"], "cpu", max_len=16)
+    assert a.shape == (1, 16, 8) and a[0, :3].min() == 1 and a[0, 3:].abs().sum() == 0
+    assert b[0, :4].min() == 1 and b[0, 4:].abs().sum() == 0
+    assert calls["checkpoint_path"] == "t5.pth" and calls["dtype"] == torch.float32 and calls["name"] == "umt5_xxl"
+
+
+def test_launcher_uses_the_wan_t5_without_the_diffusers_text_encoder(tmp_path):
+    import stat
+    import subprocess
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    py = fake / "python"
+    py.write_text('#!/bin/bash\n'
+                  'if [[ "$1" == - || "$1" == -c ]]; then exec "%s" "$@"; fi\n'
+                  'if [[ "$1" == scripts/grounded_sam2.py ]]; then '
+                  'while [[ $# -gt 0 ]]; do [[ "$1" == --out ]] && touch "$2"; shift; done; exit 0; fi\n'
+                  'if [[ "$1" == scripts/ti2v5b_replace.py ]]; then printf "ARG %%s\\n" "$@"; exit 0; fi\n'
+                  'exit 0\n' % sys.executable)
+    py.chmod(py.stat().st_mode | stat.S_IEXEC)
+    ck = tmp_path / "5b"
+    for f in ("transformer/config.json", "vae/config.json", "scheduler/scheduler_config.json"):
+        (ck / f).parent.mkdir(parents=True, exist_ok=True)
+        (ck / f).write_text("{}")
+    t5, tok = tmp_path / "t5.pth", tmp_path / "umt5-xxl"
+    t5.write_bytes(b"")
+    tok.mkdir()
+    drive, ref = tmp_path / "clip.mp4", tmp_path / "ref.png"
+    drive.write_bytes(b"")
+    ref.write_bytes(b"")
+    env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", CKPT_5B=str(ck), DRIVE=str(drive), REF_IMG=str(ref),
+               T5_WAN=str(t5), T5_TOKENIZER=str(tok), OUT_DIR=str(tmp_path / "out"), WORK_DIR=str(tmp_path / "w"))
+    p = subprocess.run(["bash", os.path.join(REPO, "scripts", "run_ti2v5b_replace.sh")], env=env,
+                       capture_output=True, text=True, timeout=120)
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, out[-2000:]
+    args = [line[4:] for line in out.splitlines() if line.startswith("ARG ")]
+    assert args[args.index("--t5-wan") + 1] == str(t5) and args[args.index("--t5-tokenizer") + 1] == str(tok)

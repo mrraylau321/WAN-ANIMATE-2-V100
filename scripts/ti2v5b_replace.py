@@ -20,6 +20,7 @@ single .pth/.safetensors (original Wan or diffusers key names) into the --model 
 import argparse
 import json
 import os
+import sys
 import time
 
 import cv2
@@ -213,6 +214,20 @@ def encode_prompts(model_dir, prompts, device, max_len=512):
     return [e[None] for e in embs]
 
 
+@torch.no_grad()
+def encode_prompts_wan(t5_ckpt, tokenizer_dir, prompts, device, max_len=512):
+    """The same UMT5-XXL encoder from a Wan checkpoint (models_t5_umt5-xxl-enc-bf16.pth, as used by Wan-Animate-2),
+    so the 11 GB diffusers text_encoder need not be downloaded. Output like encode_prompts."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from wanxiang.eval_i2v import T5Encoder
+    t5 = T5Encoder(name="umt5_xxl", text_len=max_len, dtype=torch.float32, device=torch.device(device),
+                   checkpoint_path=t5_ckpt, tokenizer_path=tokenizer_dir)
+    outs = [u.float().cpu() for u in t5(prompts)]
+    del t5
+    torch.cuda.empty_cache()
+    return [torch.cat([u, u.new_zeros(max_len - u.shape[0], u.shape[1])])[None] for u in outs]
+
+
 def write_video(path, frames, fps):
     writer = imageio.get_writer(path, fps=fps, codec="libx264", macro_block_size=1, pixelformat="yuv420p",
                                 ffmpeg_params=["-crf", "16"])
@@ -270,6 +285,9 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dtype", choices=["fp16", "fp32", "bf16"], default="fp16")
     p.add_argument("--t5-device", default="auto", help="auto: the 2nd GPU if there is one, else cpu")
+    p.add_argument("--t5-wan", help="Wan-format UMT5 checkpoint (models_t5_umt5-xxl-enc-bf16.pth) instead of "
+                                    "<model>/text_encoder; needs --t5-tokenizer")
+    p.add_argument("--t5-tokenizer", help="umt5-xxl tokenizer dir for --t5-wan")
     p.add_argument("--transformer-ckpt", help="one checkpoint file instead of <model>/transformer")
     p.add_argument("--expert", action="append", default=[], metavar="FILE@LO-HI",
                    help="checkpoint used for timesteps LO <= t < HI (0..1000); repeat to cover 0-1000")
@@ -283,7 +301,10 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     t5_dev = a.t5_device if a.t5_device != "auto" else ("cuda:1" if torch.cuda.device_count() > 1 else "cpu")
     print(f"text encoder on {t5_dev} (fp32) ...")
-    ctx, ctx_null = encode_prompts(a.model, [a.prompt or " ", a.negative], t5_dev)
+    if a.t5_wan:
+        ctx, ctx_null = encode_prompts_wan(a.t5_wan, a.t5_tokenizer, [a.prompt or " ", a.negative], t5_dev)
+    else:
+        ctx, ctx_null = encode_prompts(a.model, [a.prompt or " ", a.negative], t5_dev)
     vae = AutoencoderKLWan.from_pretrained(os.path.join(a.model, "vae"), torch_dtype=torch.float32).to(device)
     vae.enable_tiling()
     cfg_dir = os.path.join(a.model, "transformer")

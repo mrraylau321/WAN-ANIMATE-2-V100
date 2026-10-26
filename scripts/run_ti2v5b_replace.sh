@@ -13,6 +13,9 @@
 # Other TI2V-5B-architecture weights (CKPT_5B still gives configs, VAE, text encoder, scheduler):
 #           TRANSFORMER_CKPT=<one .pth/.safetensors>   or   EXPERTS="<file>@<lo>-<hi> <file>@<lo>-<hi> ..."
 #           (timestep ranges, t = 1000 * sigma, together covering 0-1000; one expert on the GPU at a time)
+#           T5_WAN=<models_t5_umt5-xxl-enc-bf16.pth> T5_TOKENIZER=<umt5-xxl dir>: the Wan-format text encoder
+#           (e.g. the Wan-Animate-2 one) instead of $CKPT_5B/text_encoder. With both, CKPT_5B only needs
+#           model_index.json scheduler/ transformer/config.json vae/ (~2.8 GB).
 set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO"
@@ -20,8 +23,10 @@ command -v python >/dev/null || { echo "python not found: activate the conda env
 : "${CKPT_5B:?set CKPT_5B=<Wan2.2-TI2V-5B-Diffusers dir>}"
 : "${DRIVE:?set DRIVE=<driving video>}"
 : "${REF_IMG:?set REF_IMG=<reference image>}"
-for f in "$CKPT_5B/transformer/config.json" "$CKPT_5B/vae/config.json" "$CKPT_5B/text_encoder/config.json" \
-         "$CKPT_5B/tokenizer/tokenizer_config.json" "$CKPT_5B/scheduler/scheduler_config.json" "$DRIVE" "$REF_IMG"; do
+if [[ -n ${T5_WAN:-} ]]; then TEXT=("$T5_WAN" "${T5_TOKENIZER:?set T5_TOKENIZER=<umt5-xxl dir> with T5_WAN}")
+else TEXT=("$CKPT_5B/text_encoder/config.json" "$CKPT_5B/tokenizer/tokenizer_config.json"); fi
+for f in "$CKPT_5B/transformer/config.json" "$CKPT_5B/vae/config.json" "${TEXT[@]}" \
+         "$CKPT_5B/scheduler/scheduler_config.json" "$DRIVE" "$REF_IMG"; do
   [[ -e $f ]] || { echo "missing: $f" >&2; exit 1; }
 done
 python - <<'EOF' || { echo "needs diffusers >= 0.35: pip install -U 'diffusers>=0.35'" >&2; exit 1; }
@@ -57,5 +62,5 @@ python scripts/ti2v5b_replace.py --model "$CKPT_5B" --drive "$DRIVE" --g0 "$SCEN
   --fps "${FPS:-24}" --steps "${STEPS:-40}" --strength "${STRENGTH:-0.6}" --guide "${GUIDE:-5}" \
   --dilate "${DILATE:-15}" --grow "${GROW:-1}" --free-steps "${FREE:-2}" --dtype "${DTYPE:-fp16}" \
   --seed "${SEED:-42}" --out "$OUT_DIR" $([[ ${NO_BLEND:-0} == 1 ]] && echo --no-blend) \
-  ${TRANSFORMER_CKPT:+--transformer-ckpt "$TRANSFORMER_CKPT"} $(for e in ${EXPERTS:-}; do echo --expert "$e"; done) \
+  ${T5_WAN:+--t5-wan "$T5_WAN" --t5-tokenizer "$T5_TOKENIZER"} ${TRANSFORMER_CKPT:+--transformer-ckpt "$TRANSFORMER_CKPT"} $(for e in ${EXPERTS:-}; do echo --expert "$e"; done) \
   2>&1 | tee "$LOG"
