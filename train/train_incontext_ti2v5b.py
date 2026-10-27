@@ -6,12 +6,12 @@ In-context layout (no new modules): the driving clip's latents are patch-embedde
 video tokens; both go through every block together (joint self-attention, shared Q/K/V), with the SAME RoPE positions
 (driving frame j sits on video frame j) and their own per-token timestep. Only the video tokens are decoded.
   video tokens   frame 0 = the reference image, clean (timestep 0, TI2V's own first-frame scheme); frames 1.. noised
-  driving tokens the driving latents noised to a random level s (timestep 1000 s): s hides appearance detail, so the
-                 answer cannot be copied from the driving clip (it is the same clip as the target in self-reconstruction)
+  driving tokens the driving latents noised to a random level s (timestep 1000 s), making appearance harder to copy
+                 from the same clip used as the target; cross-identity evaluation must establish motion transfer
 Flow matching, Wan convention: x_sigma = (1 - sigma) x0 + sigma noise, the model predicts v = noise - x0.
 
 Training samples are written by train/prep_incontext_ti2v5b.py: <data>/*.pt with "target" [48, F, h, w] (latent
-frame 0 = the reference image) and "drive" [48, F, h, w] (appearance-destroyed driving clip), plus <data>/text.pt.
+frame 0 = the reference image) and "drive" [48, F, h, w] (appearance-degraded driving clip), plus <data>/text.pt.
   torchrun --nproc_per_node 4 train/train_incontext_ti2v5b.py --model <TI2V-5B diffusers dir> --data <cache> --out <run>
 """
 import argparse
@@ -103,7 +103,9 @@ class CachedLatents(torch.utils.data.Dataset):
     """<folder>/*.pt from prep_incontext_ti2v5b.py (each: target, drive) and <folder>/text.pt (text, neg)."""
 
     def __init__(self, folder):
-        self.files = sorted(f for f in glob.glob(os.path.join(folder, "*.pt")) if os.path.basename(f) != "text.pt")
+        self.folder = os.path.realpath(folder)
+        self.files = sorted(f for f in glob.glob(os.path.join(folder, "*.pt"))
+                            if os.path.basename(f) != "text.pt" and not os.path.basename(f).startswith(".tmp_"))
         if not self.files:
             raise FileNotFoundError(f"no samples in {folder}")
         self.text = torch.load(os.path.join(folder, "text.pt"), map_location="cpu", weights_only=True)
@@ -145,25 +147,95 @@ def setup_dist():
     return 0, 1
 
 
+def read_training_state(out, config, steps, device):
+    """Load a matching run or refuse to overwrite its checkpoints."""
+    if not out:
+        return None
+    path = os.path.join(out, "state.pt")
+    if os.path.exists(path):
+        state = torch.load(path, map_location=device, weights_only=True)
+        changed = [key for key in config if state["config"].get(key) != config[key]]
+        if changed:
+            raise ValueError(f"cannot resume {path}: run settings differ: {', '.join(changed)}")
+        if state["step"] > steps:
+            raise ValueError(f"cannot resume step {state['step']} with stop step {steps}")
+        return state
+    if glob.glob(os.path.join(out, "lora_*.safetensors")):
+        raise ValueError(f"cannot resume {out}: LoRA checkpoints exist without state.pt; use a new output directory")
+    return None
+
+
+def export_lora(lora, out, step):
+    """Publish an inference adapter atomically."""
+    from safetensors.torch import save_file
+    name = f"lora_{step:06d}.safetensors"
+    tmp = os.path.join(out, f".tmp_{name}")
+    save_file(lora, tmp)
+    os.replace(tmp, os.path.join(out, name))
+
+
+def save_training_state(out, state):
+    """Publish resume state before its matching inference export."""
+    os.makedirs(out, exist_ok=True)
+    tmp = os.path.join(out, ".tmp_state.pt")
+    torch.save(state, tmp)
+    os.replace(tmp, os.path.join(out, "state.pt"))
+    export_lora(state["lora"], out, state["step"])
+
+
 def train(model, dataset, steps, out=None, lr=1e-4, rank_lora=64, shift=5.0, drive_noise=(0.2, 0.7), warmup=50,
           accum=1, log_every=10, save_every=500, seed=0, device="cpu", amp=False, use_checkpoint=False,
-          rank=0, world=1, log=print):
-    """One sample per rank per micro-step; LoRA gradients all-reduced over ranks (every rank holds the whole model)."""
+          rank=0, world=1, log=print, total_steps=None, model_dir=None):
+    """All-reduced LoRA training; total_steps preserves the run plan when a call stops early at steps."""
+    total_steps = steps if total_steps is None else total_steps
+    if steps > total_steps:
+        raise ValueError("steps cannot exceed the planned total_steps")
+    config = dict(steps=total_steps, rank=rank_lora, lr=lr, drive_noise=list(drive_noise), data=dataset.folder,
+                  warmup=warmup, accum=accum, seed=seed, world=world, shift=shift, amp=amp,
+                  model=os.path.realpath(model_dir) if model_dir else None, weights=str(next(model.parameters()).dtype))
+    state_path = os.path.join(out, "state.pt") if out else None
+    state = read_training_state(out, config, steps, device)
+    torch.manual_seed(seed)
     params = add_lora(model, rank_lora)
     model.to(device).train()
     for p in params:                                             # LoRA weights stay float32 (AMP master weights)
         p.data = p.data.float()
+    if state:
+        keys = {k for k, _ in model.named_parameters() if k.endswith((".A", ".B"))}
+        if state["lora"].keys() != keys:
+            raise ValueError(f"cannot resume {state_path}: LoRA keys differ")
+        model.load_state_dict(state["lora"], strict=False)
+    if world > 1:
+        for p in params:
+            dist.broadcast(p.data, src=0)
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / max(1, warmup)))
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     g = torch.Generator().manual_seed(seed + 1000 * rank)
+    start, k, skipped, skip_streak = 0, 0, 0, 0
+    if state:
+        opt.load_state_dict(state["optimizer"])
+        sched.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
+        start, k = state["step"], state["cursor"]
+        skipped, skip_streak = state["skipped"], state["skip_streak"]
+        rng = state["rng"][rank]
+        g.set_state(rng["sample"].cpu())
+        torch.set_rng_state(rng["torch"].cpu())
+        if rng["cuda"] is not None:
+            torch.cuda.set_rng_state(rng["cuda"].cpu(), device)
+        del state
+        if rank == 0 and not os.path.exists(os.path.join(out, f"lora_{start:06d}.safetensors")):
+            export_lora(lora_state_dict(model), out, start)       # recover interruption between state and export
     order = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(seed))
     text = dataset.text["text"].to(device).float()
     if rank == 0:
         log(f"LoRA r{rank_lora}: {sum(p.numel() for p in params) / 1e6:.2f} M trainable, {len(dataset)} samples, "
             f"{world} rank(s) x {accum} accum, {steps} steps, amp {amp}, checkpoint {use_checkpoint}")
-    history, t0, k = [], time.time(), 0
-    for step in range(1, steps + 1):
+        if start:
+            log(f"resuming {state_path} at step {start}, sample cursor {k}")
+    history, t0 = [], time.time()
+    for step in range(start + 1, steps + 1):
         opt.zero_grad(set_to_none=True)
         step_loss = 0.0
         for _ in range(accum):
@@ -184,21 +256,44 @@ def train(model, dataset, steps, out=None, lr=1e-4, rank_lora=64, shift=5.0, dri
                 dist.all_reduce(p.grad)
                 p.grad /= world
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+        scale = scaler.get_scale()
         scaler.step(opt)
         scaler.update()
-        sched.step()
+        if scaler.get_scale() < scale:
+            skipped += 1
+            skip_streak += 1
+        else:
+            skip_streak = 0
+            sched.step()
+        if skip_streak >= 50:
+            raise RuntimeError(f"50 consecutive AMP optimizer updates skipped at step {step}; check fp16 gradients")
         if not math.isfinite(step_loss):
-            raise RuntimeError(f"non-finite loss at step {step}: try --weights fp32 or a lower --lr")
+            raise RuntimeError(f"non-finite loss at step {step}: inspect overflowing projections; "
+                               "fp32 weight storage still uses fp16 autocast")
         history.append(step_loss)
-        if rank == 0 and step % log_every == 0:
-            mem = f", {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB peak" if device != "cpu" else ""
-            log(f"step {step}: loss {sum(history[-log_every:]) / log_every:.4f}, "
-                f"{(time.time() - t0) / step:.1f} s/step{mem}")
-        if rank == 0 and out and (step % save_every == 0 or step == steps):
-            from safetensors.torch import save_file
-            os.makedirs(out, exist_ok=True)
-            save_file(lora_state_dict(model), os.path.join(out, f"lora_{step:06d}.safetensors"))
+        if rank == 0 and (step <= start + 3 or step % log_every == 0):
+            mem = torch.cuda.max_memory_allocated(device) / 2**30 if torch.device(device).type == "cuda" else 0.0
+            recent = history[-log_every:]
+            log(f"step {step}: loss {sum(recent) / len(recent):.4f}, "
+                f"{(time.time() - t0) / (step - start):.1f} s/step, {mem:.1f} GiB peak, "
+                f"scale {scaler.get_scale():g}, skipped {skipped}, updates {step - skipped}, grad norm {grad_norm:.4f}")
+        if out and (step % save_every == 0 or step == steps):
+            rng = dict(sample=g.get_state(), torch=torch.get_rng_state(),
+                       cuda=torch.cuda.get_rng_state(device) if torch.device(device).type == "cuda" else None)
+            rngs = [None] * world
+            if world > 1:
+                dist.all_gather_object(rngs, rng)
+            else:
+                rngs[0] = rng
+            if rank == 0:
+                state = dict(config=config, lora=lora_state_dict(model), optimizer=opt.state_dict(), scheduler=sched.state_dict(),
+                             scaler=scaler.state_dict(), step=step, cursor=k, rng=rngs,
+                             skipped=skipped, skip_streak=skip_streak)
+                save_training_state(out, state)
+                del state
+            if world > 1:
+                dist.barrier()
     return history
 
 
@@ -226,7 +321,7 @@ def main():
     log = lambda m: print(f"[rank {rank}] {m}", flush=True)
     train(model, CachedLatents(a.data), a.steps, a.out, a.lr, a.rank, a.shift, tuple(a.drive_noise), accum=a.accum,
           save_every=a.save_every, seed=a.seed, device=device, amp=device != "cpu", use_checkpoint=device != "cpu",
-          rank=rank, world=world, log=log)
+          rank=rank, world=world, log=log, model_dir=a.model)
     if world > 1:
         dist.destroy_process_group()
 

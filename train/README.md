@@ -12,7 +12,7 @@ tiny model (`tests/test_train_incontext.py`); real training needs a data-prep st
 |---|---|---|
 | `target` | C, T, h, w | latents of the clip to reconstruct |
 | `ref` | C, 1, h, w | the reference image (character) |
-| `drive` | C, T, h, w | the driving clip: another person doing the motion (teacher pair from Wan-Animate-2), or the target clip with its appearance destroyed (`augment_driving`, self-reconstruction); never the untouched target, the model would just copy it |
+| `drive` | C, T, h, w | the driving clip: another person doing the motion (teacher pair from Wan-Animate-2), or the target clip with its appearance degraded (`augment_driving`, self-reconstruction) to make copying harder |
 | `zero` | C, T, h, w | latents of an all-grey clip (unknown frames of the image-to-video condition) |
 | `clip_ref`, `clip_drive` | 257, 1280 | CLIP image features of the reference and of the first driving frame |
 | `text`, `text_ref` | L, 4096 | T5 of the prompt and of the driving prompt |
@@ -48,6 +48,17 @@ itself works, which Wan-Animate-2 cannot (it is already trained for this). Scrip
 | `infer_incontext_ti2v5b.py` | reference image + driving video → video (`--lora`), or the untrained base with the same input (no `--lora`) |
 | `run_pilot_ti2v5b.sh` | all stages on one node: `bash train/run_pilot_ti2v5b.sh` (each stage resumes) |
 
-None of the conditions contains a copyable answer: the reference is another moment of the clip, the driving clip has
-no colours or texture, is not pixel-aligned with the target, and is noised in latent space.
-Check that it works: the `infer` stage writes the trained and the untrained result side by side with the driving video.
+The conditions are made harder to copy: the reference is another moment of the clip, and the driving clip gets
+grey/blur/zoom/shift augmentation and latent noise. Clips without a sufficiently separated reference/window pair
+are skipped and counted. Appearance information can remain; held-out cross-identity evaluation is what shows motion
+transfer. Compare the same drive with different references, the same reference with different drives, and static or
+shuffled driving controls. The `infer` stage writes trained and untrained outputs beside the driving video.
+
+Prep resumes each missing window deterministically and publishes samples and `text.pt` atomically. `manifest.json`
+records the cache settings; incompatible settings or an old cache without a manifest require a new cache directory.
+Training resumes from atomic `state.pt` checkpoints (LoRA, optimizer, scheduler, scaler, step, sample cursor and
+per-rank RNG state). Run settings, including the planned total steps, must match; use a new output directory to
+change them. For an early stop in a Python test, `train(..., steps=3, total_steps=6)` retains the six-step plan for
+`train(..., steps=6)` to resume. The launcher still skips training when the final LoRA export exists.
+AMP logs include scale and skipped updates; only real updates advance the LR schedule, and 50 consecutive skips
+stop training. Step/checkpoint numbers count attempted updates.

@@ -107,7 +107,7 @@ def cmd_score(a):
     done = set()
     if os.path.exists(a.out):                                  # resume
         done = {r["name"] for r in csv.DictReader(open(a.out))}
-    new = not os.path.exists(a.out)
+    new = not os.path.exists(a.out) or os.path.getsize(a.out) == 0
     with open(a.out, "a", newline="") as fh:
         w = csv.DictWriter(fh, FIELDS)
         if new:

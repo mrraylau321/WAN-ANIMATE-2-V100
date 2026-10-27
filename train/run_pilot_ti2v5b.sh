@@ -12,6 +12,17 @@
 # Knobs (env): VIDEOS CKPT_5B WORK GPUS STEPS FRAMES REF DRIVE GDINO T5_WAN T5_TOKENIZER MASTER_PORT
 #   WEIGHTS=fp16  frozen weights stored in fp16 (10 GB instead of 20 GB per GPU) if train/infer runs out of memory
 set -euo pipefail
+pids=()
+cleanup() {
+  local status=$? pid
+  trap - EXIT INT TERM
+  for pid in ${pids[@]+"${pids[@]}"}; do kill "$pid" 2>/dev/null || true; done
+  for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" 2>/dev/null || true; done
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ENV_PREFIX=${ENV_PREFIX:-/home/ma-user/anaconda3/envs/wan_animate_2}
 [[ -d $ENV_PREFIX/bin ]] && export PATH="$ENV_PREFIX/bin:$PATH" PYTHONNOUSERSITE=1
@@ -33,13 +44,15 @@ echo "repo $REPO | videos $VIDEOS | 5B $CKPT_5B | work $WORK | GPUs $GPUS | stag
 [[ -f $CKPT_5B/transformer/config.json && -f $CKPT_5B/vae/config.json ]] || { echo "TI2V-5B diffusers weights missing in $CKPT_5B" >&2; exit 1; }
 
 shards() {  # run "$@ --shard i/N" on every GPU in parallel, fail if any shard fails
-  local pids=() i
+  local i
+  pids=()
   for i in "${!GPU[@]}"; do
     CUDA_VISIBLE_DEVICES=${GPU[$i]} "$@" --shard "$i/$N" > "$WORK/$(basename "$2" .py)_$i.log" 2>&1 &
     pids+=($!)
   done
   for i in "${!pids[@]}"; do
     wait "${pids[$i]}" || { echo "shard $i failed: see $WORK/$(basename "$2" .py)_$i.log" >&2; exit 1; }
+    unset 'pids[i]'
   done
 }
 
@@ -56,21 +69,22 @@ for stage in $STAGES; do
           --out "$WORK/scores_$i.csv" --shard "$i/$N" > "$WORK/filter_clips_$i.log" 2>&1 &
         pids+=($!)
       done
-      for i in "${!pids[@]}"; do wait "${pids[$i]}" || { echo "filter shard $i failed: $WORK/filter_clips_$i.log" >&2; exit 1; }; done ;;
+      for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || { echo "filter shard $i failed: $WORK/filter_clips_$i.log" >&2; exit 1; }
+        unset 'pids[i]'
+      done ;;
     select)
       python train/filter_clips.py select --scores "$WORK"/scores_*.csv --out "$WORK/pass.txt" ;;
     prep)
       [[ -f $WORK/pass.txt ]] || { echo "run filter + select first ($WORK/pass.txt missing)" >&2; exit 1; }
       T5=()
       [[ -n ${T5_WAN:-} ]] && T5=(--t5-wan "$T5_WAN" --t5-tokenizer "${T5_TOKENIZER:?set T5_TOKENIZER with T5_WAN}")
-      if [[ ! -f $WORK/cache/text.pt ]]; then
-        echo "== prep: text embedding"
-        CUDA_VISIBLE_DEVICES=${GPU[0]} python train/prep_incontext_ti2v5b.py --model "$CKPT_5B" --videos "$VIDEOS" \
-          --out "$WORK/cache" --text-only ${T5[@]+"${T5[@]}"}
-      fi
+      echo "== prep: validate cache and prepare text embedding"
+      CUDA_VISIBLE_DEVICES=${GPU[0]} python train/prep_incontext_ti2v5b.py --model "$CKPT_5B" --videos "$VIDEOS" \
+        --out "$WORK/cache" --frames "$FRAMES" --text-only ${T5[@]+"${T5[@]}"}
       echo "== prep: $(grep -c . "$WORK/pass.txt") clips on $N GPUs (logs $WORK/prep_incontext_ti2v5b_<i>.log)"
       shards python train/prep_incontext_ti2v5b.py --model "$CKPT_5B" --videos "$VIDEOS" --list "$WORK/pass.txt" \
-        --out "$WORK/cache" --frames "$FRAMES"
+        --out "$WORK/cache" --frames "$FRAMES" ${T5[@]+"${T5[@]}"}
       echo "$(ls "$WORK/cache" | grep -c '_w[0-9]*\.pt$') samples in $WORK/cache" ;;
     train)
       last=$WORK/run/lora_$(printf %06d "$STEPS").safetensors
@@ -80,7 +94,7 @@ for stage in $STAGES; do
         train/train_incontext_ti2v5b.py --model "$CKPT_5B" --data "$WORK/cache" --out "$WORK/run" --steps "$STEPS" ${WEIGHTS:+--weights "$WEIGHTS"} \
         2>&1 | tee -a "$WORK/train.log" ;;
     infer)
-      lora=$(ls "$WORK"/run/lora_*.safetensors 2>/dev/null | tail -1)
+      lora=$(ls "$WORK"/run/lora_*.safetensors 2>/dev/null | tail -1 || true)
       [[ -n $lora ]] || { echo "no LoRA in $WORK/run: run train first" >&2; exit 1; }
       for l in "$lora" ""; do
         echo "== infer: ${l:-untrained base}"

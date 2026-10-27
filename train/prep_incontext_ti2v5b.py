@@ -1,19 +1,20 @@
 """Data prep for the TI2V-5B in-context pilot: clips -> cached latents for train_incontext_ti2v5b.py.
 
-Per clip, --windows samples (self-reconstruction, made so the answer cannot be read off the conditions):
+Per clip, --windows samples (self-reconstruction, conditions made harder to copy):
   window    --frames frames at --fps from a random start (4k + 1 frames: TI2V-5B's VAE)
   target    [reference frame, window frames 1..]: latent frame 0 = the reference image, then the clip to rebuild
-  reference a frame at least --ref-gap seconds away from the window (another pose), else the farthest frame
-  drive     the window itself, zoomed out and shifted by one random amount (no pixel alignment with the target),
-            then grey + blur + random contrast (augment_driving: no colours or texture to copy); the training loop
-            also noises its latents
+  reference a frame at least --ref-gap seconds away from the window (another moment); skip if none is found
+  drive     the window itself, zoomed out and shifted by one random amount, then grey + blur + random contrast;
+            the training loop also noises its latents. Cross-identity evaluation must establish motion transfer.
 Plus text.pt: the UMT5 embedding of --prompt (one generic prompt for every clip) and of the negative prompt.
 
   python train/prep_incontext_ti2v5b.py --model <TI2V-5B diffusers dir> --videos <dir> --list pass.txt --out <cache> \\
       --shard 0/4        (run one shard per GPU; finished samples are skipped, so it can be restarted)
 """
 import argparse
+import fcntl
 import glob
+import json
 import os
 import sys
 import zlib
@@ -77,12 +78,15 @@ def pick_window(n_src, src_fps, fps, frames, ref_gap, rng):
     span = (frames - 1) * step
     if n_src - 1 < span:
         return None
-    start = rng.uniform(0, n_src - 1 - span)
-    idx = [min(int(round(start + j * step)), n_src - 1) for j in range(frames)]
     gap = ref_gap * src_fps
-    far = [i for i in range(n_src) if i < idx[0] - gap or i > idx[-1] + gap]
-    ref = int(rng.choice(far)) if far else (0 if idx[0] > n_src - 1 - idx[-1] else n_src - 1)
-    return idx, ref
+    for _ in range(10):
+        start = rng.uniform(0, n_src - 1 - span)
+        idx = [min(int(round(start + j * step)), n_src - 1) for j in range(frames)]
+        far = [i for i in range(n_src) if (i < idx[0] and idx[0] - i >= gap)
+               or (i > idx[-1] and i - idx[-1] >= gap)]
+        if far:
+            return idx, int(rng.choice(far))
+    return None
 
 
 def jitter(frames, scale, dx, dy):
@@ -130,6 +134,39 @@ def encode_text(a, device):
     return dict(text=text, neg=neg, prompt=a.prompt)
 
 
+def atomic_save(value, path):
+    """Publish a complete tensor cache file; temporary names are hidden from the sample glob."""
+    tmp = os.path.join(os.path.dirname(path), f".tmp_{os.path.basename(path)}.{os.getpid()}")
+    torch.save(value, tmp)
+    os.replace(tmp, path)
+
+
+def check_manifest(a):
+    """Serialize shard startup and refuse incompatible or unversioned caches."""
+    manifest = {k: getattr(a, k) for k in ("width", "height", "frames", "fps", "windows", "ref_gap",
+                                          "max_shift", "prompt", "seed")}
+    manifest.update(model=os.path.realpath(a.model), scale=list(a.scale),
+                    t5_wan=os.path.realpath(a.t5_wan) if a.t5_wan else None,
+                    t5_tokenizer=os.path.realpath(a.t5_tokenizer) if a.t5_tokenizer else None)
+    path = os.path.join(a.out, "manifest.json")
+    with open(os.path.join(a.out, ".manifest.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(path):
+            with open(path) as fh:
+                old = json.load(fh)
+            if old != manifest:
+                changed = [k for k in manifest if old.get(k) != manifest[k]]
+                raise ValueError(f"cache manifest differs ({', '.join(changed)}): use a new cache directory")
+        else:
+            if glob.glob(os.path.join(a.out, "*.pt")):
+                raise ValueError(f"cache {a.out} has no manifest: use a new cache directory")
+            tmp = os.path.join(a.out, f".tmp_manifest.json.{os.getpid()}")
+            with open(tmp, "w") as fh:
+                json.dump(manifest, fh, indent=2)
+                fh.write("\n")
+            os.replace(tmp, path)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="Wan2.2-TI2V-5B-Diffusers folder (vae/, text_encoder/, tokenizer/)")
@@ -155,13 +192,14 @@ def main():
         p.error("--frames must be 4k + 1")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(a.out, exist_ok=True)
+    check_manifest(a)
     text_path = os.path.join(a.out, "text.pt")
-    if a.text_only or not os.path.exists(text_path):
+    if not os.path.exists(text_path):
         if a.shard.split("/")[0] == "0" or a.text_only:
-            torch.save(encode_text(a, device), text_path)
+            atomic_save(encode_text(a, device), text_path)
             print(f"-> {text_path}", flush=True)
-        if a.text_only:
-            return
+    if a.text_only:
+        return
 
     names = [l.strip() for l in open(a.list)] if a.list else sorted(os.path.basename(f) for f in
                                                                      glob.glob(os.path.join(a.videos, "*.mp4")))
@@ -173,7 +211,7 @@ def main():
     done = skipped = 0
     for k, name in enumerate(names):
         stem = os.path.splitext(name)[0]
-        if os.path.exists(os.path.join(a.out, f"{stem}_w0.pt")):
+        if all(os.path.exists(os.path.join(a.out, f"{stem}_w{w}.pt")) for w in range(a.windows)):
             continue
         seed = a.seed * 1_000_003 + zlib.crc32(stem.encode()) % 1_000_003
         rng, g = np.random.default_rng(seed), torch.Generator().manual_seed(seed)
@@ -183,10 +221,15 @@ def main():
             print(f"skip {name}: {e}", flush=True)
             skipped += 1
             continue
+        if len(samples) < a.windows:
+            print(f"skip {name}: no separated reference/window pair for {a.windows - len(samples)} window(s)", flush=True)
+            skipped += 1
         for target, drive, meta in samples:
-            torch.save(dict(target=vae_encode(vae, target, device)[0].half().cpu(),
-                            drive=vae_encode(vae, drive, device)[0].half().cpu(), meta=meta),
-                       os.path.join(a.out, f"{stem}_w{meta['window']}.pt"))
+            path = os.path.join(a.out, f"{stem}_w{meta['window']}.pt")
+            if os.path.exists(path):
+                continue
+            atomic_save(dict(target=vae_encode(vae, target, device)[0].half().cpu(),
+                             drive=vae_encode(vae, drive, device)[0].half().cpu(), meta=meta), path)
             done += 1
         if (k + 1) % 20 == 0:
             print(f"shard {a.shard}: {k + 1}/{len(names)} clips, {done} samples, {skipped} skipped", flush=True)

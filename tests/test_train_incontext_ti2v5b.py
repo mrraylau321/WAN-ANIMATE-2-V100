@@ -133,7 +133,7 @@ def test_train_lowers_the_loss_and_lora_roundtrips(tmp_path):
     assert np.isfinite(hist).all()
     after = fixed_loss(m, ds)
     assert after < 0.9 * before, (before, after)
-    saved = sorted(os.listdir(tmp_path / "run"))
+    saved = sorted(p.name for p in (tmp_path / "run").glob("*.safetensors"))
     assert saved == ["lora_000040.safetensors", "lora_000080.safetensors"]
     fresh = tt.load_lora(tiny_transformer(), str(tmp_path / "run" / saved[-1]))
     x, drive, t_x, text = inputs()
@@ -144,13 +144,36 @@ def test_train_lowers_the_loss_and_lora_roundtrips(tmp_path):
 
 def test_pick_window_keeps_the_reference_away():
     rng = np.random.default_rng(0)
-    for _ in range(20):
-        idx, ref = prep.pick_window(300, 30.0, 24, 33, 1.0, rng)
-        assert len(idx) == 33 and idx == sorted(idx) and idx[-1] <= 299
-        assert ref < idx[0] - 30 or ref > idx[-1] + 30
-    assert prep.pick_window(20, 30.0, 24, 33, 1.0, rng) is None       # shorter than the window
-    idx, ref = prep.pick_window(45, 30.0, 24, 33, 1.0, np.random.default_rng(1))  # no frame 1 s away: farthest end
-    assert ref in (0, 44)
+    accepted = 0
+    for n in (20, 33, 45, 60, 75, 100, 300):
+        for src_fps in (24, 29.97, 30):
+            for _ in range(30):
+                picked = prep.pick_window(n, src_fps, 24, 33, 1.0, rng)
+                if picked is None:
+                    continue
+                idx, ref = picked
+                accepted += 1
+                assert len(idx) == 33 and idx == sorted(idx) and idx[-1] < n and 0 <= ref < n
+                assert ref < idx[0] or ref > idx[-1]
+                assert min(abs(ref - i) for i in idx) / src_fps >= 1.0
+    assert accepted > 0
+    for n, fps in ((20, 30), (33, 24), (45, 30)):
+        assert prep.pick_window(n, fps, 24, 33, 1.0, rng) is None
+
+
+def test_pick_window_retries_and_zero_gap_still_excludes_the_window():
+    class Rng:
+        starts = iter([34, 0])
+
+        def uniform(self, *args):
+            return next(self.starts)
+
+        def choice(self, values):
+            return values[-1]
+
+    idx, ref = prep.pick_window(100, 24, 24, 33, 2, Rng())
+    assert idx[0] == 0 and ref - idx[-1] >= 48
+    assert prep.pick_window(33, 24, 24, 33, 0, np.random.default_rng(0)) is None
 
 
 def test_jitter_and_destroy_appearance():
@@ -181,17 +204,29 @@ def test_prep_main_end_to_end_then_train(tmp_path, monkeypatch):
     model_dir = tmp_path / "ti2v"
     tiny_vae().save_pretrained(str(model_dir / "vae"))
     out = tmp_path / "cache"
-    out.mkdir()
-    torch.save(dict(text=torch.randn(1, 7, 16), neg=torch.randn(1, 7, 16)), out / "text.pt")  # no T5 on CPU
+    monkeypatch.setattr(prep, "encode_text", lambda *_: dict(text=torch.randn(1, 7, 16), neg=torch.randn(1, 7, 16)))
     monkeypatch.setattr(sys, "argv", ["prep", "--model", str(model_dir), "--videos", str(vids), "--out", str(out),
                                       "--width", "32", "--height", "64", "--frames", "9", "--windows", "2",
                                       "--ref-gap", "0.2"])
     prep.main()
-    names = sorted(f for f in os.listdir(out) if f != "text.pt")
+    names = sorted(p.name for p in out.glob("*_w*.pt"))
     assert names == ["a_w0.pt", "a_w1.pt", "b_w0.pt", "b_w1.pt"]
     s = torch.load(out / "a_w0.pt", weights_only=True)
     assert s["target"].shape == s["drive"].shape == (48, 3, 4, 2) and s["target"].dtype == torch.float16
     assert s["meta"]["src"] == "a.mp4"
+    originals = {name: (out / name).read_bytes() for name in names}
+    missing = torch.load(out / "a_w1.pt", weights_only=True)
+    (out / "a_w1.pt").unlink()
+    prep.main()
+    restored = torch.load(out / "a_w1.pt", weights_only=True)
+    assert restored["meta"] == missing["meta"]
+    for key in ("target", "drive"):
+        torch.testing.assert_close(restored[key], missing[key], rtol=0, atol=0)
+    for name in ("a_w0.pt", "b_w0.pt", "b_w1.pt"):
+        assert (out / name).read_bytes() == originals[name]
+    assert not list(out.glob(".tmp_*"))
+    (out / ".tmp_broken.pt").write_bytes(b"incomplete")
+    assert len(tt.CachedLatents(out)) == 4
     m = tiny_transformer()
     hist = tt.train(m, tt.CachedLatents(str(out)), steps=3, log=lambda *_: None)
     assert len(hist) == 3 and np.isfinite(hist).all()
@@ -243,18 +278,21 @@ def test_sample_pins_the_reference_and_runs_with_and_without_drive():
     assert float(sig[0]) == 1.0 and float(sig[-1]) == 0.0 and (sig[1:] < sig[:-1]).all()
 
 
-def _dist_worker(rank, world, port, folder, out, result):
+def _dist_worker(rank, world, port, folder, out, result, steps):
     import torch.distributed as dist
     os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "127.0.0.1", str(port)
     dist.init_process_group("gloo", rank=rank, world_size=world)
     m = tiny_transformer()
-    tt.train(m, tt.CachedLatents(folder), steps=4, out=out, lr=1e-2, rank_lora=4, warmup=1, save_every=4,
+    torch.manual_seed(1234 + 77 * rank)                            # undo tiny_transformer's common RNG state
+    torch.rand(rank + 5)
+    tt.train(m, tt.CachedLatents(folder), steps=steps, out=out, lr=1e-2, rank_lora=4, warmup=1, save_every=4,
              rank=rank, world=world, log=lambda *_: None)
     torch.save(tt.lora_state_dict(m), os.path.join(result, f"rank{rank}.pt"))
     dist.destroy_process_group()
 
 
-def test_two_ranks_stay_in_sync_and_only_rank0_saves(tmp_path):
+@pytest.mark.parametrize("steps", [0, 4])
+def test_two_ranks_stay_in_sync_and_only_rank0_saves(tmp_path, steps):
     import socket
     import torch.multiprocessing as mp
     write_cache(tmp_path / "cache", n=4)
@@ -262,9 +300,388 @@ def test_two_ranks_stay_in_sync_and_only_rank0_saves(tmp_path):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     (tmp_path / "res").mkdir()
-    mp.spawn(_dist_worker, args=(2, port, str(tmp_path / "cache"), str(tmp_path / "run"), str(tmp_path / "res")),
+    mp.spawn(_dist_worker, args=(2, port, str(tmp_path / "cache"), str(tmp_path / "run"), str(tmp_path / "res"), steps),
              nprocs=2, join=True)
     a, b = (torch.load(tmp_path / "res" / f"rank{r}.pt", weights_only=True) for r in (0, 1))
     assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a)       # all-reduced gradients
-    assert any(v.abs().sum() > 0 for k, v in a.items() if k.endswith(".B"))        # and they did train
-    assert os.listdir(tmp_path / "run") == ["lora_000004.safetensors"]
+    if steps:
+        assert any(v.abs().sum() > 0 for k, v in a.items() if k.endswith(".B"))    # and they did train
+        assert sorted(os.listdir(tmp_path / "run")) == ["lora_000004.safetensors", "state.pt"]
+    else:
+        assert not (tmp_path / "run").exists()
+
+
+def test_train_resume_matches_uninterrupted_run(tmp_path):
+    write_cache(tmp_path / "cache", n=5)
+    ds = tt.CachedLatents(tmp_path / "cache")
+    kw = dict(lr=1e-2, rank_lora=4, warmup=5, accum=2, save_every=3, seed=17, log=lambda *_: None)
+    full, first, resumed = tiny_transformer(), tiny_transformer(), tiny_transformer()
+    hist = tt.train(full, ds, steps=6, out=tmp_path / "full", **kw)
+    initial = tt.train(first, ds, steps=3, total_steps=6, out=tmp_path / "split", **kw)
+    saved = torch.load(tmp_path / "split" / "state.pt", weights_only=True)
+    assert saved["step"] == 3 and saved["cursor"] == 6 and saved["config"]["steps"] == 6
+    assert saved["optimizer"]["state"] and saved["scheduler"]["last_epoch"] == 3
+    assert "scaler" in saved and len(saved["rng"]) == 1
+    before = (tmp_path / "split" / "lora_000003.safetensors").read_bytes()
+    torch.manual_seed(999)
+    rest = tt.train(resumed, ds, steps=6, out=tmp_path / "split", **kw)
+    assert initial + rest == pytest.approx(hist, rel=1e-7, abs=1e-8)
+    assert (tmp_path / "split" / "lora_000003.safetensors").read_bytes() == before
+    a, b = tt.lora_state_dict(full), tt.lora_state_dict(resumed)
+    for key in a:
+        torch.testing.assert_close(a[key], b[key], rtol=1e-7, atol=1e-8)
+    final = torch.load(tmp_path / "split" / "state.pt", weights_only=True)
+    assert final["step"] == 6 and final["cursor"] == 12
+    assert final["scheduler"]["last_epoch"] == 6
+    assert not list((tmp_path / "split").glob(".tmp_*"))
+
+
+@pytest.mark.parametrize("change, field", [({"steps": 3}, "steps"), ({"rank_lora": 8}, "rank"),
+                                          ({"lr": 0.02}, "lr"), ({"drive_noise": (0.1, 0.8)}, "drive_noise"),
+                                          ({}, "data")])
+def test_resume_refuses_different_run(tmp_path, change, field):
+    write_cache(tmp_path / "cache")
+    ds = tt.CachedLatents(tmp_path / "cache")
+    kw = dict(steps=2, out=tmp_path / "run", rank_lora=4, log=lambda *_: None)
+    tt.train(tiny_transformer(), ds, **kw)
+    original = (tmp_path / "run" / "state.pt").read_bytes()
+    if field == "data":
+        write_cache(tmp_path / "other")
+        ds = tt.CachedLatents(tmp_path / "other")
+    with pytest.raises(ValueError, match=f"settings differ: {field}"):
+        tt.train(tiny_transformer(), ds, **(kw | change))
+    assert (tmp_path / "run" / "state.pt").read_bytes() == original
+
+
+def test_resume_refuses_exports_without_state(tmp_path):
+    write_cache(tmp_path / "cache")
+    out = tmp_path / "run"
+    out.mkdir()
+    (out / "lora_000003.safetensors").write_bytes(b"old run")
+    with pytest.raises(ValueError, match="without state.pt"):
+        tt.train(tiny_transformer(), tt.CachedLatents(tmp_path / "cache"), steps=6, out=out)
+
+
+def test_atomic_training_state_survives_interrupted_save(tmp_path, monkeypatch):
+    write_cache(tmp_path / "cache")
+    ds = tt.CachedLatents(tmp_path / "cache")
+    out = tmp_path / "run"
+    kw = dict(out=out, rank_lora=4, save_every=3, log=lambda *_: None)
+    tt.train(tiny_transformer(), ds, steps=3, total_steps=6, **kw)
+    original = (out / "state.pt").read_bytes()
+
+    def interrupted_save(value, path):
+        assert os.path.basename(path).startswith(".tmp_")
+        with open(path, "wb") as fh:
+            fh.write(b"partial")
+        raise OSError("interrupted write")
+
+    monkeypatch.setattr(torch, "save", interrupted_save)
+    with pytest.raises(OSError, match="interrupted write"):
+        tt.train(tiny_transformer(), ds, steps=6, **kw)
+    assert (out / "state.pt").read_bytes() == original
+    assert not (out / "lora_000006.safetensors").exists()
+
+
+def test_resume_recovers_export_after_state_was_published(tmp_path, monkeypatch):
+    write_cache(tmp_path / "cache")
+    ds = tt.CachedLatents(tmp_path / "cache")
+    out = tmp_path / "run"
+    kw = dict(steps=3, out=out, rank_lora=4, log=lambda *_: None)
+    export = tt.export_lora
+    with monkeypatch.context() as patch:
+        def fail_export(*args):
+            raise OSError("interrupted export")
+        patch.setattr(tt, "export_lora", fail_export)
+        with pytest.raises(OSError, match="interrupted export"):
+            tt.train(tiny_transformer(), ds, **kw)
+    assert (out / "state.pt").exists() and not (out / "lora_000003.safetensors").exists()
+    assert tt.train(tiny_transformer(), ds, **kw) == []
+    assert (out / "lora_000003.safetensors").exists() and tt.export_lora is export
+
+
+@pytest.mark.parametrize("field, value", [("model", "other"), ("width", 64), ("height", 128), ("frames", 13),
+                                         ("fps", 12), ("windows", 3), ("ref_gap", 2), ("scale", [0.7, 1]),
+                                         ("max_shift", 0.1), ("prompt", "other"), ("seed", 1)])
+def test_cache_manifest_refuses_different_settings(tmp_path, field, value):
+    from types import SimpleNamespace
+    a = SimpleNamespace(out=str(tmp_path), model="ti2v", width=32, height=64, frames=9, fps=24, windows=2,
+                        ref_gap=1, scale=(0.85, 1), max_shift=0.05, prompt="person", seed=0,
+                        t5_wan=None, t5_tokenizer=None)
+    prep.check_manifest(a)
+    prep.check_manifest(a)                                      # same settings are restartable
+    original = (tmp_path / "manifest.json").read_bytes()
+    setattr(a, field, value)
+    with pytest.raises(ValueError, match=f"manifest differs .*{field}"):
+        prep.check_manifest(a)
+    assert (tmp_path / "manifest.json").read_bytes() == original
+
+
+def test_atomic_cache_write_keeps_previous_file(tmp_path, monkeypatch):
+    path = tmp_path / "text.pt"
+    prep.atomic_save({"text": torch.ones(1)}, str(path))
+    original = path.read_bytes()
+
+    def interrupted_save(value, tmp):
+        assert os.path.basename(tmp).startswith(".tmp_") and not str(tmp).endswith(".pt")
+        with open(tmp, "wb") as fh:
+            fh.write(b"partial")
+        raise OSError("interrupted write")
+
+    monkeypatch.setattr(torch, "save", interrupted_save)
+    with pytest.raises(OSError, match="interrupted write"):
+        prep.atomic_save({"text": torch.zeros(1)}, str(path))
+    assert path.read_bytes() == original
+    assert list(tmp_path.glob("*.pt")) == [path]
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_filter_writes_header_for_missing_or_empty_csv(tmp_path, monkeypatch, empty):
+    import csv
+    from types import SimpleNamespace
+    out = tmp_path / "scores.csv"
+    if empty:
+        out.touch()
+    (tmp_path / "a.mp4").touch()
+    monkeypatch.setitem(sys.modules, "grounded_sam2", SimpleNamespace(Detector=lambda *_: object()))
+    row = dict(name="a.mp4", frames=48, fps=24, person_frac=1, multi_frac=0, height=0.6, motion=0.1)
+    monkeypatch.setattr(fc, "score_clip", lambda *_: row)
+    a = SimpleNamespace(out=str(out), videos=str(tmp_path), gdino="stub", box_threshold=0.3,
+                        text_threshold=0.2, shard="0/1", samples=4, gap=0.5)
+    fc.cmd_score(a)
+    fc.cmd_score(a)
+    with out.open() as fh:
+        reader = csv.DictReader(fh)
+        assert reader.fieldnames == fc.FIELDS
+        rows = list(reader)
+    assert len(rows) == 1 and rows[0]["name"] == "a.mp4"
+
+
+@pytest.mark.parametrize("always_skip", [False, True])
+def test_amp_skips_schedule_and_reports_stalls(tmp_path, monkeypatch, always_skip):
+    class Scaler:
+        value, calls = 128.0, 0
+
+        def scale(self, loss):
+            return loss
+
+        def unscale_(self, opt):
+            pass
+
+        def get_scale(self):
+            return self.value
+
+        def step(self, opt):
+            self.calls += 1
+            if not always_skip and self.calls % 2 == 0:
+                opt.step()
+
+        def update(self):
+            if always_skip or self.calls % 2:
+                self.value /= 2
+
+        def state_dict(self):
+            return dict(scale=self.value)
+
+    scaler, logs = Scaler(), []
+    monkeypatch.setattr(torch.amp, "GradScaler", lambda *a, **kw: scaler)
+    write_cache(tmp_path / "cache")
+    ds = tt.CachedLatents(tmp_path / "cache")
+    kw = dict(out=tmp_path / "run", rank_lora=4, log_every=10, log=logs.append)
+    if always_skip:
+        with pytest.raises(RuntimeError, match="50 consecutive AMP optimizer updates skipped at step 50"):
+            tt.train(tiny_transformer(), ds, steps=60, **kw)
+        assert scaler.calls == 50
+    else:
+        tt.train(tiny_transformer(), ds, steps=6, **kw)
+        state = torch.load(tmp_path / "run" / "state.pt", weights_only=True)
+        assert state["skipped"] == 3 and state["skip_streak"] == 0
+        assert state["scheduler"]["last_epoch"] == 3
+        assert state["scaler"]["scale"] == 16
+        lines = [line for line in logs if line.startswith("step ")]
+        assert [line.split(":")[0] for line in lines] == ["step 1", "step 2", "step 3"]
+        assert all("scale " in line and "skipped " in line and "s/step" in line and "GiB peak" in line for line in lines)
+
+
+@pytest.mark.parametrize("with_lora, tiling", [(False, True), (True, True), (False, False)])
+def test_infer_freezes_and_separates_model_device_lifetimes(tmp_path, monkeypatch, with_lora, tiling):
+    import diffusers
+    import ti2v5b_replace as helpers
+
+    class Model(torch.nn.Module):
+        def __init__(self, name):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.name, self.where = name, "cpu"
+
+        def to(self, device):
+            self.where = device
+            assert model.where == "cpu" or vae.where == "cpu"
+            return self
+
+    class Latent:
+        def to(self, *args):
+            return self
+
+        def float(self):
+            return self
+
+    model, vae, events = Model("transformer"), Model("vae"), []
+    if tiling:
+        vae.enable_tiling = lambda: events.append("tiling")
+    monkeypatch.setattr(diffusers.WanTransformer3DModel, "from_pretrained", lambda *a, **kw: model)
+    monkeypatch.setattr(diffusers.AutoencoderKLWan, "from_pretrained", lambda *a, **kw: vae)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch, "load", lambda *a, **kw: dict(text=Latent(), neg=Latent()))
+    monkeypatch.setattr(inf, "load_lora", lambda m, p: m.register_parameter("adapter", torch.nn.Parameter(torch.ones(1))))
+    frames = np.zeros((9, 32, 32, 3), np.uint8)
+    monkeypatch.setattr(helpers, "read_clip", lambda *a: (frames, 24))
+    monkeypatch.setattr(helpers, "cover", lambda *a: frames[0])
+    monkeypatch.setattr(cv2, "imread", lambda *a: frames[0])
+    monkeypatch.setattr(helpers, "write_video", lambda *a: None)
+
+    def encode(*args):
+        assert model.where == "cpu" and vae.where == "cuda"
+        events.append("encode")
+        return Latent()
+
+    def sample(*args, **kwargs):
+        assert model.where == "cuda" and vae.where == "cpu"
+        assert all(not p.requires_grad for p in model.parameters())
+        assert all(not p.requires_grad for p in vae.parameters())
+        assert not model.training
+        events.append("sample")
+        return Latent()
+
+    def decode(*args):
+        assert model.where == "cpu" and vae.where == "cuda"
+        events.append("decode")
+        return frames
+
+    monkeypatch.setattr(helpers, "vae_encode", encode)
+    monkeypatch.setattr(helpers, "vae_decode", decode)
+    monkeypatch.setattr(inf, "sample", sample)
+    argv = ["infer", "--model", "model", "--text", "text.pt", "--ref", "ref.png", "--drive", "drive.mp4",
+            "--out", str(tmp_path), "--width", "32", "--height", "32", "--frames", "9"]
+    monkeypatch.setattr(sys, "argv", argv + (["--lora", "lora.safetensors"] if with_lora else []))
+    inf.main()
+    assert events == (["tiling"] if tiling else []) + ["encode", "encode", "sample", "decode"]
+
+
+def test_adapter_seed_and_broadcast_precede_optimizer(tmp_path, monkeypatch):
+    write_cache(tmp_path / "cache")
+    ds = tt.CachedLatents(tmp_path / "cache")
+    states, broadcasts = [], []
+    adam = torch.optim.AdamW
+
+    def broadcast(p, src):
+        assert p.device.type == "cpu" and p.dtype == torch.float32 and src == 0
+        broadcasts.append(p)
+        p.fill_(0.125)                                          # the optimizer must see the broadcast value
+
+    def optimizer(params, **kwargs):
+        assert len(broadcasts) == len(params)
+        assert all(p.eq(0.125).all() for p in params)
+        return adam(params, **kwargs)
+
+    monkeypatch.setattr(tt.dist, "broadcast", broadcast)
+    monkeypatch.setattr(torch.optim, "AdamW", optimizer)
+    tt.train(tiny_transformer(), ds, steps=0, world=2, rank_lora=4, log=lambda *_: None)
+    monkeypatch.setattr(torch.optim, "AdamW", adam)
+    for seed in (123, 456):
+        model = tiny_transformer()
+        torch.manual_seed(seed)
+        tt.train(model, ds, steps=0, seed=17, rank_lora=4, log=lambda *_: None)
+        states.append(tt.lora_state_dict(model))
+    for key in states[0]:
+        torch.testing.assert_close(states[0][key], states[1][key], rtol=0, atol=0)
+
+
+def launcher_env(tmp_path):
+    from pathlib import Path
+    root, work = tmp_path / "repo", tmp_path / "work"
+    (root / "train").mkdir(parents=True)
+    script = root / "train" / "run_pilot_ti2v5b.sh"
+    script.write_text((Path(REPO) / "train" / script.name).read_text())
+    for part in ("transformer", "vae"):
+        folder = tmp_path / "model" / part
+        folder.mkdir(parents=True)
+        (folder / "config.json").write_text("{}")
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "a.mp4").touch()
+    work.mkdir()
+    (work / "pass.txt").write_text("a.mp4\n")
+    binary = tmp_path / "env" / "bin"
+    binary.mkdir(parents=True)
+    env = dict(os.environ, WORK=str(work), CKPT_5B=str(tmp_path / "model"), VIDEOS=str(videos), GPUS="0,1",
+               ENV_PREFIX=str(binary.parent), GDINO=str(tmp_path / "gdino"))
+    env.pop("T5_WAN", None)
+    env.pop("T5_TOKENIZER", None)
+    return script, work, binary, env
+
+
+@pytest.mark.parametrize("stage, signal_name", [("filter", None), ("prep", None), ("prep", "SIGINT"),
+                                               ("filter", "SIGTERM")])
+def test_launcher_reaps_shards_on_failure_or_signal(tmp_path, stage, signal_name):
+    import signal
+    import subprocess
+    import time
+    script, work, binary, env = launcher_env(tmp_path)
+    stub = binary / "python"
+    stub.write_text(f"#!{sys.executable}\n" + '''import os, signal, sys, time
+from pathlib import Path
+if "--text-only" in sys.argv:
+    sys.exit(0)
+work = Path(os.environ["WORK"])
+rank = sys.argv[sys.argv.index("--shard") + 1].split("/")[0]
+def stop(*args):
+    (work / ("stopped_" + rank)).touch()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+(work / ("pid_" + rank)).write_text(str(os.getpid()))
+if rank == "0" and os.environ["FAIL_SHARD"] == "1":
+    deadline = time.monotonic() + 5
+    while len(list(work.glob("pid_*"))) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    sys.exit(7)
+while True:
+    time.sleep(0.01)
+''')
+    stub.chmod(0o755)
+    env["FAIL_SHARD"] = "0" if signal_name else "1"
+    proc = subprocess.Popen(["bash", str(script), stage], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    try:
+        if signal_name:
+            deadline = time.monotonic() + 5
+            while len(list(work.glob("pid_*"))) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert len(list(work.glob("pid_*"))) == 2
+            proc.send_signal(getattr(signal, signal_name))
+        output, _ = proc.communicate(timeout=10)
+        assert proc.returncode == ({"SIGINT": 130, "SIGTERM": 143}.get(signal_name, 1)), output
+        if not signal_name:
+            assert "shard 0 failed" in output and ".log" in output
+        for path in work.glob("pid_*"):
+            with pytest.raises(ProcessLookupError):
+                os.kill(int(path.read_text()), 0)
+        assert (work / "stopped_1").exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for path in work.glob("pid_*"):
+            try:
+                os.kill(int(path.read_text()), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+def test_launcher_explains_missing_lora(tmp_path):
+    import subprocess
+    script, _, _, env = launcher_env(tmp_path)
+    result = subprocess.run(["bash", str(script), "infer"], env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 1
+    assert "no LoRA in" in result.stderr and "run train first" in result.stderr

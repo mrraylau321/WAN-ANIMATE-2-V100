@@ -49,7 +49,8 @@ def sample(model, ref, drive, text, neg=None, steps=40, shift=5.0, drive_level=0
             if guide > 1 and neg is not None:
                 v = incontext_forward(model, x, t_x, neg, **kw).float() * (1 - guide) + v * guide
         if not torch.isfinite(v).all():
-            raise RuntimeError(f"non-finite output at step {i}: use --weights fp32")
+            raise RuntimeError(f"non-finite output at step {i}: inspect overflowing projections; "
+                               "fp32 weight storage still uses fp16 autocast")
         x = x + float(sig[i + 1] - sig[i]) * v
         x[:, :, :1] = ref
     return x
@@ -88,8 +89,11 @@ def main():
     model = WanTransformer3DModel.from_pretrained(os.path.join(a.model, "transformer"), torch_dtype=dtype)
     if a.lora:
         load_lora(model, a.lora)
-    model.to(device).eval()
+    model.requires_grad_(False).eval()
     vae = AutoencoderKLWan.from_pretrained(os.path.join(a.model, "vae"), torch_dtype=torch.float32).to(device)
+    vae.requires_grad_(False).eval()
+    if hasattr(vae, "enable_tiling"):
+        vae.enable_tiling()
     texts = torch.load(a.text, map_location="cpu", weights_only=True)
 
     frames, _ = read_clip(a.drive, a.fps, a.frames, a.width, a.height)
@@ -98,9 +102,17 @@ def main():
     drive_aug = destroy_appearance(frames, g)
     z_ref = vae_encode(vae, ref[None], device)
     z_drive = vae_encode(vae, drive_aug, device)
+    vae.to("cpu")
+    if device != "cpu":
+        torch.cuda.empty_cache()
+    model.to(device)
     t0 = time.time()
     z = sample(model, z_ref, z_drive, texts["text"].to(device).float(), texts["neg"].to(device).float(), a.steps,
                a.shift, a.drive_noise, a.guide, g, amp=device != "cpu", use_drive=not a.no_drive)
+    model.to("cpu")
+    if device != "cpu":
+        torch.cuda.empty_cache()
+    vae.to(device)
     out = vae_decode(vae, z)
     os.makedirs(a.out, exist_ok=True)
     tag = "nodrive" if a.no_drive else (os.path.splitext(os.path.basename(a.lora))[0] if a.lora else "base")

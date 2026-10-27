@@ -10,8 +10,8 @@ One training sample = one clip, already encoded (CACHE_KEYS; latents use the VAE
   target      [C, T, h, w]  the clip to reconstruct (T latent frames)
   ref         [C, 1, h, w]  the reference image (the character)
   drive       [C, T, h, w]  the driving clip: another person doing the motion (teacher pair), or the target clip
-                            itself with its appearance destroyed (self-reconstruction, see augment_driving), never
-                            the untouched target - the model would just copy it
+                            itself with its appearance degraded (self-reconstruction, see augment_driving), making
+                            copying harder; cross-identity evaluation must establish motion transfer
   zero        [C, T, h, w]  an all-grey clip (the unknown frames of the image-to-video condition), one per shape
   clip_ref    [257, 1280]   CLIP image features of the reference;  clip_drive: of the first driving frame
   text [L, 4096]            T5 of the prompt;  text_ref [L', 4096]: T5 of the driving prompt
@@ -94,11 +94,11 @@ def trainable_state_dict(model):
 
 # ------------------------------------------------------------------ data
 def augment_driving(frames, generator=None):
-    """Destroy appearance, keep motion (self-reconstruction driving): grey, blurred, random contrast and brightness.
+    """Make appearance harder to copy: grey, blurred, random contrast and brightness.
     frames: float [3, n, H, W] in [-1, 1] (pixels, before VAE encoding). The same random draw for the whole clip."""
     g = generator
     x = frames.mean(0, keepdim=True)                                         # grey: no colours, no clothes colour
-    k = int(torch.randint(2, 6, (1,), generator=g)) * 2 + 1                  # blur: fine texture gone
+    k = int(torch.randint(2, 6, (1,), generator=g)) * 2 + 1                  # blur: reduce fine texture
     x = F.avg_pool2d(x.permute(1, 0, 2, 3), k, stride=1, padding=k // 2, count_include_pad=False).permute(1, 0, 2, 3)
     c = 0.5 + torch.rand(1, generator=g) * 1.0
     b = (torch.rand(1, generator=g) - 0.5) * 0.6
