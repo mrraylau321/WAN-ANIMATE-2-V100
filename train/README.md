@@ -34,3 +34,20 @@ joint attention and `qkv_layers` returns the video-stream QKV of the dual- and s
 1. Data prep: clips → (VAE, CLIP, T5) → cached `*.pt` with the keys above; teacher pairs generated with Wan-Animate-2.
 2. Multi-GPU (FSDP / sequence parallel) and gradient checkpointing for real model sizes.
 3. Evaluation: pose error between driving and output, identity similarity to the reference.
+
+## Pilot on Wan2.2-TI2V-5B (runnable end to end)
+
+TI2V-5B (public diffusers weights) cannot follow a driving video out of the box, so it can show whether the method
+itself works, which Wan-Animate-2 cannot (it is already trained for this). Scripts:
+
+| file | does |
+|---|---|
+| `filter_clips.py` | `score`: Grounding DINO person boxes + motion per clip; `select`: one main person, ≥ 40 % of the frame height, the stillest 35 % dropped |
+| `prep_incontext_ti2v5b.py` | 2 windows per clip → cached latents: `target` (latent frame 0 = a reference frame ≥ 1 s from the window) and `drive` (the window zoomed/shifted, grey, blurred); `text.pt` (one generic prompt) |
+| `train_incontext_ti2v5b.py` | driving tokens appended to the video tokens (same RoPE positions, own timestep, latents noised to a random level 0.2–0.7), LoRA on the self-attention Q/K/V, fp16 autocast with a float32 residual stream, gradient checkpointing, `torchrun` over the GPUs |
+| `infer_incontext_ti2v5b.py` | reference image + driving video → video (`--lora`), or the untrained base with the same input (no `--lora`) |
+| `run_pilot_ti2v5b.sh` | all stages on one node: `bash train/run_pilot_ti2v5b.sh` (each stage resumes) |
+
+None of the conditions contains a copyable answer: the reference is another moment of the clip, the driving clip has
+no colours or texture, is not pixel-aligned with the target, and is noised in latent space.
+Check that it works: the `infer` stage writes the trained and the untrained result side by side with the driving video.
