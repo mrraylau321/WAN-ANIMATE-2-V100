@@ -36,7 +36,22 @@ def token_timesteps(t_frames, h, w, patch=(1, 2, 2)):
     return t_frames[:, :, None].expand(-1, -1, (h // patch[1]) * (w // patch[2])).flatten(1)
 
 
-def incontext_forward(model, x, t_x, text, drive=None, t_drive=None, use_checkpoint=False):
+def driving_rope(model, x, mode="same"):
+    """RoPE of the driving tokens. "same": the positions of the video frame they align with (driving frame j on video
+    frame j). "offset": same frame, rows moved below the video grid, so no driving token shares its exact position with
+    a video token: copying by position is no longer free, the correspondence has to be learned."""
+    if mode == "same":
+        return model.rope(x)
+    if mode != "offset":
+        raise ValueError(f"drive_rope must be same or offset, not {mode}")
+    _, _, F_, H, W = x.shape
+    p_t, p_h, p_w = model.config.patch_size
+    f, h, w = F_ // p_t, H // p_h, W // p_w
+    tall = model.rope(x.new_empty(1, 1, F_, 2 * H, W))
+    return tuple(r.reshape(1, f, 2 * h, w, 1, -1)[:, :, h:].reshape(1, f * h * w, 1, -1) for r in tall)
+
+
+def incontext_forward(model, x, t_x, text, drive=None, t_drive=None, use_checkpoint=False, drive_rope="same"):
     """WanTransformer3DModel forward with the driving tokens appended (drive=None: exactly the model's own forward).
     x, drive [B, C, F, H, W] (same shape); t_x, t_drive per-token timesteps [B, S]; text [B, L, 4096]. Returns v of x.
     The residual stream is kept in float32, so fp16 autocast only touches the matmuls."""
@@ -49,7 +64,7 @@ def incontext_forward(model, x, t_x, text, drive=None, t_drive=None, use_checkpo
     if drive is not None:
         hd = model.patch_embedding(drive).flatten(2).transpose(1, 2).float()
         h = torch.cat([h, hd], 1)
-        rope = tuple(torch.cat([r, r], 1) for r in rope)       # driving frame j on the positions of video frame j
+        rope = tuple(torch.cat([r, d], 1) for r, d in zip(rope, driving_rope(model, x, drive_rope)))
         ts = torch.cat([t_x, t_drive], 1)
     temb, tproj, enc, _ = model.condition_embedder(ts.flatten(), text, None, timestep_seq_len=ts.shape[1])
     tproj = tproj.unflatten(2, (6, -1))
@@ -121,7 +136,7 @@ class CachedLatents(torch.utils.data.Dataset):
 
 
 # ------------------------------------------------------------------ loss
-def flow_loss(model, x0, drive, text, sigma, drive_level, noise, noise_drive, use_checkpoint=False):
+def flow_loss(model, x0, drive, text, sigma, drive_level, noise, noise_drive, use_checkpoint=False, drive_rope="same"):
     """x0, drive [B, C, F, h, w]; latent frame 0 of x0 is the reference image (kept clean, timestep 0).
     MSE between predicted and true velocity on frames 1.. ."""
     B, _, F_, h, w = x0.shape
@@ -132,7 +147,7 @@ def flow_loss(model, x0, drive, text, sigma, drive_level, noise, noise_drive, us
     t_frames[:, 0] = 0
     t_drive = torch.full((B, F_), float(drive_level) * 1000, device=x0.device)
     v = incontext_forward(model, x_s, token_timesteps(t_frames, h, w), text, d_s, token_timesteps(t_drive, h, w),
-                          use_checkpoint)
+                          use_checkpoint, drive_rope)
     return F.mse_loss(v[:, :, 1:].float(), (noise - x0)[:, :, 1:].float())
 
 
@@ -185,12 +200,13 @@ def save_training_state(out, state):
 
 def train(model, dataset, steps, out=None, lr=1e-4, rank_lora=64, shift=5.0, drive_noise=(0.2, 0.7), warmup=50,
           accum=1, log_every=10, save_every=500, seed=0, device="cpu", amp=False, use_checkpoint=False,
-          rank=0, world=1, log=print, total_steps=None, model_dir=None):
+          rank=0, world=1, log=print, total_steps=None, model_dir=None, drive_rope="same"):
     """All-reduced LoRA training; total_steps preserves the run plan when a call stops early at steps."""
     total_steps = steps if total_steps is None else total_steps
     if steps > total_steps:
         raise ValueError("steps cannot exceed the planned total_steps")
     config = dict(steps=total_steps, rank=rank_lora, lr=lr, drive_noise=list(drive_noise), data=dataset.folder,
+                  drive_rope=drive_rope,
                   warmup=warmup, accum=accum, seed=seed, world=world, shift=shift, amp=amp,
                   model=os.path.realpath(model_dir) if model_dir else None, weights=str(next(model.parameters()).dtype))
     state_path = os.path.join(out, "state.pt") if out else None
@@ -248,7 +264,7 @@ def train(model, dataset, steps, out=None, lr=1e-4, rank_lora=64, shift=5.0, dri
             noise = torch.randn(x0.shape, generator=g).to(device)
             noise_d = torch.randn(x0.shape, generator=g).to(device)
             with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
-                loss = flow_loss(model, x0, drive, text, sigma, level, noise, noise_d, use_checkpoint) / accum
+                loss = flow_loss(model, x0, drive, text, sigma, level, noise, noise_d, use_checkpoint, drive_rope) / accum
             scaler.scale(loss).backward()
             step_loss += float(loss)
         if world > 1:
@@ -307,6 +323,8 @@ def main():
     p.add_argument("--rank", type=int, default=64, help="LoRA rank")
     p.add_argument("--accum", type=int, default=1, help="gradient accumulation (samples per rank per step)")
     p.add_argument("--drive-noise", type=float, nargs=2, default=(0.2, 0.7), help="driving latent noise level range")
+    p.add_argument("--drive-rope", choices=["same", "offset"], default="same",
+                   help="driving token positions: same as the aligned video frame, or rows offset below it")
     p.add_argument("--shift", type=float, default=5.0)
     p.add_argument("--save-every", type=int, default=250)
     p.add_argument("--weights", choices=["fp32", "fp16"], default="fp32",
@@ -321,7 +339,7 @@ def main():
     log = lambda m: print(f"[rank {rank}] {m}", flush=True)
     train(model, CachedLatents(a.data), a.steps, a.out, a.lr, a.rank, a.shift, tuple(a.drive_noise), accum=a.accum,
           save_every=a.save_every, seed=a.seed, device=device, amp=device != "cpu", use_checkpoint=device != "cpu",
-          rank=rank, world=world, log=log, model_dir=a.model)
+          rank=rank, world=world, log=log, model_dir=a.model, drive_rope=a.drive_rope)
     if world > 1:
         dist.destroy_process_group()
 

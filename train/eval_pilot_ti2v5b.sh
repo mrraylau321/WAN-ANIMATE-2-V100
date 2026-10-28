@@ -10,7 +10,7 @@
 #   6 base_cross_g1     run 5 without the LoRA (what the untrained model does with the same input)
 #   7 lora_cross_g5     run 5 with CFG 5
 # Clips A and B: the first two clips of $WORK/pass.txt (training clips; the reference/driving pairing of 5-7 is new).
-# Knobs (env): WORK CKPT_5B GPUS LORA CLIP_A CLIP_B REF DRIVE FRAMES WEIGHTS
+# Knobs (env): WORK CKPT_5B GPUS LORA CLIP_A CLIP_B REF DRIVE FRAMES WEIGHTS RUN DRIVE_ROPE (as in run_pilot_ti2v5b.sh)
 set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ENV_PREFIX=${ENV_PREFIX:-/home/ma-user/anaconda3/envs/wan_animate_2}
@@ -22,11 +22,12 @@ GPUS=${GPUS:-0,1,2,3}
 FRAMES=${FRAMES:-33}
 REF=${REF:-$REPO/examples/demo1/reference.png}
 DRIVE=${DRIVE:-$REPO/examples/demo1/template.mp4}
-LORA=${LORA:-$(ls "$WORK"/run/lora_*.safetensors 2>/dev/null | tail -1 || true)}
-[[ -n $LORA ]] || { echo "no LoRA in $WORK/run (set LORA=...)" >&2; exit 1; }
+RUN=${RUN:-run}
+LORA=${LORA:-$(ls "$WORK/$RUN"/lora_*.safetensors 2>/dev/null | tail -1 || true)}
+[[ -n $LORA ]] || { echo "no LoRA in $WORK/$RUN (set LORA=...)" >&2; exit 1; }
 CLIP_A=${CLIP_A:-$VIDEOS/$(sed -n 1p "$WORK/pass.txt")}
 CLIP_B=${CLIP_B:-$VIDEOS/$(sed -n 2p "$WORK/pass.txt")}
-OUT=$WORK/eval
+OUT=$WORK/eval${DRIVE_ROPE:+_$DRIVE_ROPE}
 mkdir -p "$OUT"
 cd "$REPO"
 IFS=, read -r -a GPU <<< "$GPUS"
@@ -49,7 +50,8 @@ run() {  # run <name> <gpu> <args...>
   local name=$1 gpu=$2
   shift 2
   CUDA_VISIBLE_DEVICES=$gpu python train/infer_incontext_ti2v5b.py --model "$CKPT_5B" --text "$WORK/cache/text.pt" \
-    --frames "$FRAMES" --out "$OUT" --name "$name" ${WEIGHTS:+--weights "$WEIGHTS"} "$@" > "$OUT/$name.log" 2>&1 \
+    --frames "$FRAMES" --out "$OUT" --name "$name" ${WEIGHTS:+--weights "$WEIGHTS"} \
+    ${DRIVE_ROPE:+--drive-rope "$DRIVE_ROPE"} "$@" > "$OUT/$name.log" 2>&1 \
     && echo "ok   $name" || echo "FAIL $name (see $OUT/$name.log)"
 }
 jobs=(

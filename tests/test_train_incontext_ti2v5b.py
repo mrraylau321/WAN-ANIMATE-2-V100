@@ -685,3 +685,38 @@ def test_launcher_explains_missing_lora(tmp_path):
     result = subprocess.run(["bash", str(script), "infer"], env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 1
     assert "no LoRA in" in result.stderr and "run train first" in result.stderr
+
+
+def test_offset_driving_rope_moves_only_the_driving_positions():
+    m = tiny_transformer().eval()
+    x, drive, t_x, text = inputs(F_=3, h=4, w=6)
+    same = tt.driving_rope(m, x, "same")
+    off = tt.driving_rope(m, x, "offset")
+    video = m.rope(x)
+    for a, b, v in zip(same, off, video):
+        assert a.shape == b.shape == v.shape
+        torch.testing.assert_close(a, v)
+        assert (a - b).abs().amax() > 1e-3                            # driving rows sit below the video grid
+    tall = m.rope(x.new_empty(1, 1, 3, 8, 6))                         # rows 0-1 of a twice-as-tall grid = the video's
+    torch.testing.assert_close(tall[0].reshape(1, 3, 4, 3, 1, -1)[:, :, :2].reshape(1, 18, 1, -1), video[0])
+    with torch.no_grad():
+        o1 = tt.incontext_forward(m, x, t_x, text, drive, torch.full_like(t_x, 300.0), drive_rope="offset")
+        o2 = tt.incontext_forward(m, x, t_x, text, drive, torch.full_like(t_x, 300.0))
+    assert o1.shape == x.shape and torch.isfinite(o1).all() and not torch.allclose(o1, o2)
+    with pytest.raises(ValueError):
+        tt.driving_rope(m, x, "sideways")
+
+
+def test_train_and_sample_with_offset_rope(tmp_path):
+    write_cache(tmp_path / "cache")
+    m = tiny_transformer()
+    hist = tt.train(m, tt.CachedLatents(str(tmp_path / "cache")), steps=3, out=str(tmp_path / "run"), save_every=3,
+                    drive_rope="offset", log=lambda *_: None)
+    assert np.isfinite(hist).all()
+    with pytest.raises(ValueError, match="drive_rope"):                # a run is resumed only with the same setting
+        tt.train(tiny_transformer(), tt.CachedLatents(str(tmp_path / "cache")), steps=3, out=str(tmp_path / "run"),
+                 save_every=3, drive_rope="same", log=lambda *_: None)
+    x, drive, _, text = inputs()
+    out = inf.sample(m.eval(), x[:, :, :1], drive, text, steps=2, generator=torch.Generator().manual_seed(0),
+                     drive_rope="offset")
+    assert torch.isfinite(out).all()

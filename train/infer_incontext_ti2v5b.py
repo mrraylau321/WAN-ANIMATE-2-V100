@@ -30,7 +30,7 @@ def flow_sigmas(steps, shift=5.0):
 
 @torch.no_grad()
 def sample(model, ref, drive, text, neg=None, steps=40, shift=5.0, drive_level=0.4, guide=1.0, generator=None,
-           amp=False, use_drive=True):
+           amp=False, use_drive=True, drive_rope="same"):
     """ref [1, C, 1, h, w], drive [1, C, F, h, w] (normalized latents) -> generated latents [1, C, F, h, w]."""
     B, C, F_, h, w = drive.shape
     dev = drive.device
@@ -43,7 +43,7 @@ def sample(model, ref, drive, text, neg=None, steps=40, shift=5.0, drive_level=0
         t_frames = torch.full((B, F_), float(sig[i]) * 1000, device=dev)
         t_frames[:, 0] = 0
         t_x = token_timesteps(t_frames, h, w)
-        kw = dict(drive=d, t_drive=t_drive) if use_drive else {}
+        kw = dict(drive=d, t_drive=t_drive, drive_rope=drive_rope) if use_drive else {}
         with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
             v = incontext_forward(model, x, t_x, text, **kw).float()
             if guide > 1 and neg is not None:
@@ -79,6 +79,7 @@ def main():
     p.add_argument("--drive-noise", type=float, default=0.4, help="driving latent noise (training range 0.2-0.7)")
     p.add_argument("--guide", type=float, default=1.0, help="> 1: CFG against the negative prompt (2x time)")
     p.add_argument("--no-drive", action="store_true", help="plain TI2V image-to-video (no driving tokens)")
+    p.add_argument("--drive-rope", choices=["same", "offset"], default="same", help="must match the LoRA's training")
     p.add_argument("--weights", choices=["fp32", "fp16"], default="fp32")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--name", help="output file name (default: from the inputs and settings)")
@@ -109,7 +110,8 @@ def main():
     model.to(device)
     t0 = time.time()
     z = sample(model, z_ref, z_drive, texts["text"].to(device).float(), texts["neg"].to(device).float(), a.steps,
-               a.shift, a.drive_noise, a.guide, g, amp=device != "cpu", use_drive=not a.no_drive)
+               a.shift, a.drive_noise, a.guide, g, amp=device != "cpu", use_drive=not a.no_drive,
+               drive_rope=a.drive_rope)
     model.to("cpu")
     if device != "cpu":
         torch.cuda.empty_cache()

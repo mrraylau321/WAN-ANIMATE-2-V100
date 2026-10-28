@@ -10,6 +10,7 @@
 #   train   LoRA on the self-attention Q/K/V, torchrun over the GPUs                 -> $WORK/run/lora_*.safetensors
 #   infer   official demo (reference cat + dancing template): trained LoRA vs untrained base -> $WORK/infer
 # Knobs (env): VIDEOS CKPT_5B WORK GPUS STEPS FRAMES REF DRIVE GDINO T5_WAN T5_TOKENIZER MASTER_PORT
+#   RUN=run_offset DRIVE_ROPE=offset  a second experiment in its own run folder (train + infer use both)
 #   WEIGHTS=fp16  frozen weights stored in fp16 (10 GB instead of 20 GB per GPU) if train/infer runs out of memory
 set -euo pipefail
 pids=()
@@ -32,6 +33,7 @@ WORK=${WORK:-/cache/pilot_ti2v5b}
 GDINO=${GDINO:-$REPO/ckpts/grounding-dino-base}
 GPUS=${GPUS:-0,1,2,3}
 STEPS=${STEPS:-2000}
+RUN=${RUN:-run}
 FRAMES=${FRAMES:-33}
 REF=${REF:-$REPO/examples/demo1/reference.png}
 DRIVE=${DRIVE:-$REPO/examples/demo1/template.mp4}
@@ -87,19 +89,19 @@ for stage in $STAGES; do
         --out "$WORK/cache" --frames "$FRAMES" ${T5[@]+"${T5[@]}"}
       echo "$(ls "$WORK/cache" | grep -c '_w[0-9]*\.pt$') samples in $WORK/cache" ;;
     train)
-      last=$WORK/run/lora_$(printf %06d "$STEPS").safetensors
+      last=$WORK/$RUN/lora_$(printf %06d "$STEPS").safetensors
       if [[ -f $last ]]; then echo "== train: $last exists, skipped"; continue; fi
       echo "== train: $STEPS steps on $N GPUs (log $WORK/train.log)"
       CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node "$N" --master_port "${MASTER_PORT:-29531}" \
-        train/train_incontext_ti2v5b.py --model "$CKPT_5B" --data "$WORK/cache" --out "$WORK/run" --steps "$STEPS" ${WEIGHTS:+--weights "$WEIGHTS"} \
+        train/train_incontext_ti2v5b.py --model "$CKPT_5B" --data "$WORK/cache" --out "$WORK/$RUN" --steps "$STEPS" ${WEIGHTS:+--weights "$WEIGHTS"} ${DRIVE_ROPE:+--drive-rope "$DRIVE_ROPE"} \
         2>&1 | tee -a "$WORK/train.log" ;;
     infer)
-      lora=$(ls "$WORK"/run/lora_*.safetensors 2>/dev/null | tail -1 || true)
-      [[ -n $lora ]] || { echo "no LoRA in $WORK/run: run train first" >&2; exit 1; }
+      lora=$(ls "$WORK/$RUN"/lora_*.safetensors 2>/dev/null | tail -1 || true)
+      [[ -n $lora ]] || { echo "no LoRA in $WORK/$RUN: run train first" >&2; exit 1; }
       for l in "$lora" ""; do
         echo "== infer: ${l:-untrained base}"
         CUDA_VISIBLE_DEVICES=${GPU[0]} python train/infer_incontext_ti2v5b.py --model "$CKPT_5B" ${l:+--lora "$l"} \
-          --text "$WORK/cache/text.pt" --ref "$REF" --drive "$DRIVE" --frames "$FRAMES" --out "$WORK/infer" ${WEIGHTS:+--weights "$WEIGHTS"}
+          --text "$WORK/cache/text.pt" --ref "$REF" --drive "$DRIVE" --frames "$FRAMES" --out "$WORK/infer" ${WEIGHTS:+--weights "$WEIGHTS"} ${DRIVE_ROPE:+--drive-rope "$DRIVE_ROPE"}
       done ;;
     *) echo "unknown stage $stage (filter select prep train infer)" >&2; exit 2 ;;
   esac
