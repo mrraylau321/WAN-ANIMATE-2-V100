@@ -96,10 +96,16 @@ def jitter(frames, scale, dx, dy):
     return np.stack([cv2.warpAffine(f, m, (w, h), borderMode=cv2.BORDER_REPLICATE) for f in frames])
 
 
-def destroy_appearance(frames, generator=None):
-    """uint8 [n, H, W, 3] -> grey, blurred, random contrast (augment_driving), uint8."""
+def destroy_appearance(frames, generator=None, norm=False):
+    """uint8 [n, H, W, 3] -> grey, blurred, random contrast (augment_driving), uint8. norm: every frame is also set to
+    the same mean and spread of brightness, so lighting changes (strobes, a red stage turning light grey) carry no
+    signal the model could copy; shapes and motion stay."""
     x = torch.from_numpy(frames).float().div(127.5).sub(1).permute(3, 0, 1, 2)
     y = augment_driving(x, generator)
+    if norm:
+        mean = y.mean(dim=(0, 2, 3), keepdim=True)
+        std = y.std(dim=(0, 2, 3), keepdim=True).clamp_min(1e-3)
+        y = ((y - mean) / std * 0.4).clamp(-1, 1)
     return ((y + 1) * 127.5).round().clamp(0, 255).byte().permute(1, 2, 3, 0).numpy()
 
 
@@ -118,7 +124,7 @@ def make_sample(path, a, rng, generator):
         target = np.concatenate([ref_img[None], clip[1:]])
         scale = rng.uniform(*a.scale)
         dx, dy = rng.uniform(-a.max_shift, a.max_shift, 2)
-        drive = destroy_appearance(jitter(clip, scale, dx, dy), generator)
+        drive = destroy_appearance(jitter(clip, scale, dx, dy), generator, getattr(a, "drive_norm", False))
         out.append((target, drive, dict(src=os.path.basename(path), window=w, start=int(idx[0]), ref=int(ref),
                                         src_fps=float(src_fps), fps=float(a.fps), scale=float(scale),
                                         dx=float(dx), dy=float(dy))))
@@ -145,6 +151,7 @@ def check_manifest(a):
     """Serialize shard startup and refuse incompatible or unversioned caches."""
     manifest = {k: getattr(a, k) for k in ("width", "height", "frames", "fps", "windows", "ref_gap",
                                           "max_shift", "prompt", "seed")}
+    manifest["drive_norm"] = bool(getattr(a, "drive_norm", False))
     manifest.update(model=os.path.realpath(a.model), scale=list(a.scale),
                     t5_wan=os.path.realpath(a.t5_wan) if a.t5_wan else None,
                     t5_tokenizer=os.path.realpath(a.t5_tokenizer) if a.t5_tokenizer else None)
@@ -181,6 +188,7 @@ def main():
     p.add_argument("--ref-gap", type=float, default=1.0, help="seconds between the window and the reference frame")
     p.add_argument("--scale", type=float, nargs=2, default=(0.85, 1.0), help="driving zoom-out range")
     p.add_argument("--max-shift", type=float, default=0.05, help="driving shift, fraction of width/height")
+    p.add_argument("--drive-norm", action="store_true", help="per-frame brightness normalisation of the driving clip")
     p.add_argument("--prompt", default=PROMPT)
     p.add_argument("--t5-wan", help="Wan-format UMT5 checkpoint instead of the diffusers text_encoder")
     p.add_argument("--t5-tokenizer", help="umt5-xxl tokenizer dir (with --t5-wan)")

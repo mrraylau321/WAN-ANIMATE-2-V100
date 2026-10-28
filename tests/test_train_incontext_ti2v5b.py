@@ -732,3 +732,33 @@ def test_val_losses_real_shuffled_none(tmp_path):
     assert res["real"][0.3] != res["none"][0.3]                       # the driving tokens change the prediction
     again = vl.val_losses(m, tt.CachedLatents(str(tmp_path / "cache")), n=3, sigmas=(0.3, 0.9))
     assert again == res                                              # fixed seeds: comparable across checkpoints
+
+
+def test_drive_norm_equalises_frame_brightness():
+    rng = np.random.default_rng(0)
+    base = rng.integers(60, 120, (1, 32, 16, 3)).astype(np.float32)
+    frames = np.concatenate([base, base + 100, base - 40]).clip(0, 255).astype(np.uint8)   # a strobe: 3 brightness levels
+    plain = prep.destroy_appearance(frames, torch.Generator().manual_seed(0))
+    normed = prep.destroy_appearance(frames, torch.Generator().manual_seed(0), norm=True)
+    assert np.ptp(plain.reshape(3, -1).mean(1)) > 30                 # without norm the flashes survive
+    assert np.ptp(normed.reshape(3, -1).mean(1)) < 5                 # with norm: same brightness (up to clipping)
+    assert normed.shape == frames.shape and normed.dtype == np.uint8
+
+
+def test_prep_manifest_records_drive_norm(tmp_path, monkeypatch):
+    vids = tmp_path / "videos"
+    vids.mkdir()
+    write_mp4(vids / "a.mp4")
+    model_dir = tmp_path / "ti2v"
+    tiny_vae().save_pretrained(str(model_dir / "vae"))
+    out = tmp_path / "cache"
+    monkeypatch.setattr(prep, "encode_text", lambda *_: dict(text=torch.randn(1, 7, 16), neg=torch.randn(1, 7, 16)))
+    args = ["prep", "--model", str(model_dir), "--videos", str(vids), "--out", str(out), "--width", "32", "--height",
+            "64", "--frames", "9", "--windows", "1", "--ref-gap", "0.2"]
+    monkeypatch.setattr(sys, "argv", args + ["--drive-norm"])
+    prep.main()
+    import json
+    assert json.load(open(out / "manifest.json"))["drive_norm"] is True
+    monkeypatch.setattr(sys, "argv", args)                           # same cache without the flag: refused
+    with pytest.raises(ValueError, match="drive_norm"):
+        prep.main()

@@ -6,11 +6,13 @@
 # Stages:
 #   filter  Grounding DINO person boxes + motion on every clip (one shard per GPU)   -> $WORK/scores_<i>.csv
 #   select  one main person, >= 40% of the frame height, drop the stillest 35%       -> $WORK/pass.txt
-#   prep    text.pt once, then latents of 2 windows per passing clip (one shard per GPU) -> $WORK/cache
+#   prep    text.pt once, then latents of 2 windows per passing clip (one shard per GPU) -> $WORK/$CACHE
 #   train   LoRA on the self-attention Q/K/V, torchrun over the GPUs                 -> $WORK/run/lora_*.safetensors
 #   infer   official demo (reference cat + dancing template): trained LoRA vs untrained base -> $WORK/infer
 # Knobs (env): VIDEOS CKPT_5B WORK GPUS STEPS FRAMES REF DRIVE GDINO T5_WAN T5_TOKENIZER MASTER_PORT
 #   RUN=run_offset DRIVE_ROPE=offset  a second experiment in its own run folder (train + infer use both)
+#   CACHE=cache_norm DRIVE_NORM=1     a cache whose driving clips get per-frame brightness normalisation
+#                                     (prep + infer); a new cache folder, because the setting is in its manifest
 #   WEIGHTS=fp16  frozen weights stored in fp16 (10 GB instead of 20 GB per GPU) if train/infer runs out of memory
 set -euo pipefail
 pids=()
@@ -34,6 +36,9 @@ GDINO=${GDINO:-$REPO/ckpts/grounding-dino-base}
 GPUS=${GPUS:-0,1,2,3}
 STEPS=${STEPS:-2000}
 RUN=${RUN:-run}
+CACHE=${CACHE:-cache}
+NORM=()
+[[ ${DRIVE_NORM:-0} == 1 ]] && NORM=(--drive-norm)
 FRAMES=${FRAMES:-33}
 REF=${REF:-$REPO/examples/demo1/reference.png}
 DRIVE=${DRIVE:-$REPO/examples/demo1/template.mp4}
@@ -83,17 +88,17 @@ for stage in $STAGES; do
       [[ -n ${T5_WAN:-} ]] && T5=(--t5-wan "$T5_WAN" --t5-tokenizer "${T5_TOKENIZER:?set T5_TOKENIZER with T5_WAN}")
       echo "== prep: validate cache and prepare text embedding"
       CUDA_VISIBLE_DEVICES=${GPU[0]} python train/prep_incontext_ti2v5b.py --model "$CKPT_5B" --videos "$VIDEOS" \
-        --out "$WORK/cache" --frames "$FRAMES" --text-only ${T5[@]+"${T5[@]}"}
+        --out "$WORK/$CACHE" --frames "$FRAMES" --text-only ${T5[@]+"${T5[@]}"} ${NORM[@]+"${NORM[@]}"}
       echo "== prep: $(grep -c . "$WORK/pass.txt") clips on $N GPUs (logs $WORK/prep_incontext_ti2v5b_<i>.log)"
       shards python train/prep_incontext_ti2v5b.py --model "$CKPT_5B" --videos "$VIDEOS" --list "$WORK/pass.txt" \
-        --out "$WORK/cache" --frames "$FRAMES" ${T5[@]+"${T5[@]}"}
-      echo "$(ls "$WORK/cache" | grep -c '_w[0-9]*\.pt$') samples in $WORK/cache" ;;
+        --out "$WORK/$CACHE" --frames "$FRAMES" ${T5[@]+"${T5[@]}"} ${NORM[@]+"${NORM[@]}"}
+      echo "$(ls "$WORK/$CACHE" | grep -c '_w[0-9]*\.pt$') samples in $WORK/$CACHE" ;;
     train)
       last=$WORK/$RUN/lora_$(printf %06d "$STEPS").safetensors
       if [[ -f $last ]]; then echo "== train: $last exists, skipped"; continue; fi
       echo "== train: $STEPS steps on $N GPUs (log $WORK/train.log)"
       CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node "$N" --master_port "${MASTER_PORT:-29531}" \
-        train/train_incontext_ti2v5b.py --model "$CKPT_5B" --data "$WORK/cache" --out "$WORK/$RUN" --steps "$STEPS" ${WEIGHTS:+--weights "$WEIGHTS"} ${DRIVE_ROPE:+--drive-rope "$DRIVE_ROPE"} \
+        train/train_incontext_ti2v5b.py --model "$CKPT_5B" --data "$WORK/$CACHE" --out "$WORK/$RUN" --steps "$STEPS" ${WEIGHTS:+--weights "$WEIGHTS"} ${DRIVE_ROPE:+--drive-rope "$DRIVE_ROPE"} \
         2>&1 | tee -a "$WORK/train.log" ;;
     infer)
       lora=$(ls "$WORK/$RUN"/lora_*.safetensors 2>/dev/null | tail -1 || true)
@@ -101,7 +106,7 @@ for stage in $STAGES; do
       for l in "$lora" ""; do
         echo "== infer: ${l:-untrained base}"
         CUDA_VISIBLE_DEVICES=${GPU[0]} python train/infer_incontext_ti2v5b.py --model "$CKPT_5B" ${l:+--lora "$l"} \
-          --text "$WORK/cache/text.pt" --ref "$REF" --drive "$DRIVE" --frames "$FRAMES" --out "$WORK/infer" ${WEIGHTS:+--weights "$WEIGHTS"} ${DRIVE_ROPE:+--drive-rope "$DRIVE_ROPE"}
+          --text "$WORK/$CACHE/text.pt" --ref "$REF" --drive "$DRIVE" --frames "$FRAMES" --out "$WORK/infer" ${WEIGHTS:+--weights "$WEIGHTS"} ${DRIVE_ROPE:+--drive-rope "$DRIVE_ROPE"} ${NORM[@]+"${NORM[@]}"}
       done ;;
     *) echo "unknown stage $stage (filter select prep train infer)" >&2; exit 2 ;;
   esac
