@@ -81,6 +81,7 @@ def main():
     p.add_argument("--no-drive", action="store_true", help="plain TI2V image-to-video (no driving tokens)")
     p.add_argument("--weights", choices=["fp32", "fp16"], default="fp32")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--name", help="output file name (default: from the inputs and settings)")
     a = p.parse_args()
     from diffusers import AutoencoderKLWan, WanTransformer3DModel
     from ti2v5b_replace import cover, read_clip, vae_decode, vae_encode, write_video
@@ -115,8 +116,9 @@ def main():
     vae.to(device)
     out = vae_decode(vae, z)
     os.makedirs(a.out, exist_ok=True)
-    tag = "nodrive" if a.no_drive else (os.path.splitext(os.path.basename(a.lora))[0] if a.lora else "base")
-    name = f"{os.path.splitext(os.path.basename(a.ref))[0]}_{tag}_n{a.drive_noise}_{time.strftime('%H%M%S')}"
+    tag = (os.path.splitext(os.path.basename(a.lora))[0] if a.lora else "base") + ("_nodrive" if a.no_drive else "")
+    name = a.name or (f"{os.path.splitext(os.path.basename(a.ref))[0]}_{tag}_n{a.drive_noise}_g{a.guide:g}_"
+                      f"{time.strftime('%H%M%S')}")
     write_video(os.path.join(a.out, f"{name}.mp4"), out, a.fps)
     write_video(os.path.join(a.out, f"{name}_side.mp4"), side_by_side(frames[:len(out)], out), a.fps)
     write_video(os.path.join(a.out, f"{name}_drive_input.mp4"), drive_aug, a.fps)
