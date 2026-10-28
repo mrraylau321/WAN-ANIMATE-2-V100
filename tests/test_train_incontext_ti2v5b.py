@@ -720,3 +720,15 @@ def test_train_and_sample_with_offset_rope(tmp_path):
     out = inf.sample(m.eval(), x[:, :, :1], drive, text, steps=2, generator=torch.Generator().manual_seed(0),
                      drive_rope="offset")
     assert torch.isfinite(out).all()
+
+
+def test_val_losses_real_shuffled_none(tmp_path):
+    import val_ti2v5b as vl
+    write_cache(tmp_path / "cache", n=3)
+    m = tiny_transformer().eval()
+    res = vl.val_losses(m, tt.CachedLatents(str(tmp_path / "cache")), n=3, sigmas=(0.3, 0.9))
+    assert set(res) == {"real", "shuffled", "none"} and all(set(r) == {0.3, 0.9} for r in res.values())
+    assert all(np.isfinite(v) for r in res.values() for v in r.values())
+    assert res["real"][0.3] != res["none"][0.3]                       # the driving tokens change the prediction
+    again = vl.val_losses(m, tt.CachedLatents(str(tmp_path / "cache")), n=3, sigmas=(0.3, 0.9))
+    assert again == res                                              # fixed seeds: comparable across checkpoints
