@@ -13,6 +13,8 @@
 #   RUN=run_offset DRIVE_ROPE=offset  a second experiment in its own run folder (train + infer use both)
 #   CACHE=cache_norm DRIVE_NORM=1     a cache whose driving clips get per-frame brightness normalisation
 #                                     (prep + infer); a new cache folder, because the setting is in its manifest
+#   REUSE_TARGET=cache SHARDS_PER_GPU=2  faster prep of a new cache: copy target latents from an older cache of the
+#                                     same clips (only the driving treatment changed); 2 prep processes per GPU
 #   EXTRA_DATA=cache_teacher MIX="0.6 0.4"  also train on a second cache (P2 teacher pairs from
 #                                     run_teacher_pairs.sh), drawn with these weights
 #   WEIGHTS=fp16  frozen weights stored in fp16 (10 GB instead of 20 GB per GPU) if train/infer runs out of memory
@@ -52,11 +54,11 @@ cd "$REPO"
 echo "repo $REPO | videos $VIDEOS | 5B $CKPT_5B | work $WORK | GPUs $GPUS | stages: $STAGES"
 [[ -f $CKPT_5B/transformer/config.json && -f $CKPT_5B/vae/config.json ]] || { echo "TI2V-5B diffusers weights missing in $CKPT_5B" >&2; exit 1; }
 
-shards() {  # run "$@ --shard i/N" on every GPU in parallel, fail if any shard fails
-  local i
+shards() {  # run "$@ --shard i/K" (K = GPUs x SHARDS_PER_GPU) in parallel, fail if any shard fails
+  local i k=$((N * ${SHARDS_PER_GPU:-1}))
   pids=()
-  for i in "${!GPU[@]}"; do
-    CUDA_VISIBLE_DEVICES=${GPU[$i]} "$@" --shard "$i/$N" > "$WORK/$(basename "$2" .py)_$i.log" 2>&1 &
+  for ((i = 0; i < k; i++)); do
+    CUDA_VISIBLE_DEVICES=${GPU[$((i % N))]} "$@" --shard "$i/$k" > "$WORK/$(basename "$2" .py)_$i.log" 2>&1 &
     pids+=($!)
   done
   for i in "${!pids[@]}"; do
@@ -93,7 +95,8 @@ for stage in $STAGES; do
         --out "$WORK/$CACHE" --frames "$FRAMES" --text-only ${T5[@]+"${T5[@]}"} ${NORM[@]+"${NORM[@]}"}
       echo "== prep: $(grep -c . "$WORK/pass.txt") clips on $N GPUs (logs $WORK/prep_incontext_ti2v5b_<i>.log)"
       shards python train/prep_incontext_ti2v5b.py --model "$CKPT_5B" --videos "$VIDEOS" --list "$WORK/pass.txt" \
-        --out "$WORK/$CACHE" --frames "$FRAMES" ${T5[@]+"${T5[@]}"} ${NORM[@]+"${NORM[@]}"}
+        --out "$WORK/$CACHE" --frames "$FRAMES" ${T5[@]+"${T5[@]}"} ${NORM[@]+"${NORM[@]}"} \
+        ${REUSE_TARGET:+--reuse-target "$WORK/$REUSE_TARGET"}
       echo "$(ls "$WORK/$CACHE" | grep -c '_w[0-9]*\.pt$') samples in $WORK/$CACHE" ;;
     train)
       last=$WORK/$RUN/lora_$(printf %06d "$STEPS").safetensors

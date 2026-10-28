@@ -153,6 +153,17 @@ def make_teacher_sample(job, a, rng, generator):
     return np.concatenate([ref[None], teacher_frames[1:]]), drive, meta
 
 
+def reused_target(folder, name, meta, shape):
+    """The target latents of the same sample in another cache (only the driving treatment changed), or None.
+    Same clip, window start and reference frame (per-clip seeds make them deterministic) and the same latent shape."""
+    path = os.path.join(folder, name) if folder else None
+    if not path or not os.path.exists(path):
+        return None
+    old = torch.load(path, map_location="cpu", weights_only=True)
+    same = all(old["meta"].get(k) == meta.get(k) for k in ("src", "window", "start", "ref", "teacher"))
+    return old["target"] if same and tuple(old["target"].shape[1:]) == shape else None
+
+
 def encode_text(a, device):
     from ti2v5b_replace import encode_prompts, encode_prompts_wan
     if a.t5_wan:
@@ -202,6 +213,8 @@ def main():
     p.add_argument("--model", required=True, help="Wan2.2-TI2V-5B-Diffusers folder (vae/, text_encoder/, tokenizer/)")
     p.add_argument("--videos", help="folder of mp4 clips (self-reconstruction samples)")
     p.add_argument("--teacher", help="jobs.jsonl of make_teacher_jobs.py: build P2 pairs from the teacher videos instead")
+    p.add_argument("--reuse-target", help="another cache of the same clips: copy its target latents (only the driving "
+                                          "treatment changed), encode only the driving clip")
     p.add_argument("--list", help="only these clips (file names, one per line, e.g. filter_clips.py select output)")
     p.add_argument("--out", required=True)
     p.add_argument("--width", type=int, default=480)
@@ -248,7 +261,7 @@ def main():
     from diffusers import AutoencoderKLWan
     from ti2v5b_replace import vae_encode
     vae = AutoencoderKLWan.from_pretrained(os.path.join(a.model, "vae"), torch_dtype=torch.float32).to(device)
-    done = skipped = 0
+    done = skipped = reused = 0
     for k, name in enumerate(names):
         stem = os.path.splitext(name)[0]
         if all(os.path.exists(os.path.join(a.out, f"{stem}_w{w}.pt")) for w in range(a.windows)):
@@ -273,12 +286,16 @@ def main():
             path = os.path.join(a.out, f"{stem}_w{meta['window']}.pt")
             if os.path.exists(path):
                 continue
-            atomic_save(dict(target=vae_encode(vae, target, device)[0].half().cpu(),
-                             drive=vae_encode(vae, drive, device)[0].half().cpu(), meta=meta), path)
+            shape = ((len(target) - 1) // 4 + 1, a.height // 16, a.width // 16)
+            z_target = reused_target(a.reuse_target, os.path.basename(path), meta, shape)
+            reused += z_target is not None
+            if z_target is None:
+                z_target = vae_encode(vae, target, device)[0].half().cpu()
+            atomic_save(dict(target=z_target, drive=vae_encode(vae, drive, device)[0].half().cpu(), meta=meta), path)
             done += 1
         if (k + 1) % 20 == 0:
             print(f"shard {a.shard}: {k + 1}/{len(names)} clips, {done} samples, {skipped} skipped", flush=True)
-    print(f"shard {a.shard} done: {done} samples, {skipped} skipped -> {a.out}", flush=True)
+    print(f"shard {a.shard} done: {done} samples ({reused} targets reused), {skipped} skipped -> {a.out}", flush=True)
 
 
 if __name__ == "__main__":

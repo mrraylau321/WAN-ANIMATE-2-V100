@@ -850,3 +850,28 @@ def test_batch_runner_skips_finished_jobs(tmp_path, monkeypatch):
     assert [c["output_path"] for c in calls] == [jobs[0]["out"], jobs[2]["out"]]
     assert calls[1]["seed"] == 44 and calls[0]["clip_len"] == 9
     assert wab.pending(jobs) == []
+
+
+def test_prep_reuse_target_encodes_only_the_drive(tmp_path, monkeypatch):
+    import ti2v5b_replace
+    vids = tmp_path / "videos"
+    vids.mkdir()
+    write_mp4(vids / "a.mp4")
+    model_dir = tmp_path / "ti2v"
+    tiny_vae().save_pretrained(str(model_dir / "vae"))
+    monkeypatch.setattr(prep, "encode_text", lambda *_: dict(text=torch.randn(1, 7, 16), neg=torch.randn(1, 7, 16)))
+    base = ["prep", "--model", str(model_dir), "--videos", str(vids), "--width", "32", "--height", "64", "--frames", "9",
+            "--windows", "2", "--ref-gap", "0.2"]
+    monkeypatch.setattr(sys, "argv", base + ["--out", str(tmp_path / "c1")])
+    prep.main()
+    calls = []
+    real = ti2v5b_replace.vae_encode
+    monkeypatch.setattr(ti2v5b_replace, "vae_encode", lambda *a, **k: calls.append(1) or real(*a, **k))
+    monkeypatch.setattr(sys, "argv", base + ["--out", str(tmp_path / "c2"), "--drive-norm",
+                                              "--reuse-target", str(tmp_path / "c1")])
+    prep.main()
+    assert len(calls) == 2                                            # 2 windows: only the drive encoded each time
+    for w in (0, 1):
+        old = torch.load(tmp_path / "c1" / f"a_w{w}.pt", weights_only=True)
+        new = torch.load(tmp_path / "c2" / f"a_w{w}.pt", weights_only=True)
+        assert torch.equal(old["target"], new["target"]) and not torch.equal(old["drive"], new["drive"])
