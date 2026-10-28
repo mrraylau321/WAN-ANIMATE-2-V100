@@ -309,7 +309,7 @@ def train(model, dataset, steps, out=None, lr=1e-4, rank_lora=64, shift=5.0, dri
                 save_training_state(out, state)
                 del state
             if world > 1:
-                dist.barrier()
+                dist.barrier(device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None)
     return history
 
 
