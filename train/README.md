@@ -62,3 +62,18 @@ change them. For an early stop in a Python test, `train(..., steps=3, total_step
 `train(..., steps=6)` to resume. The launcher still skips training when the final LoRA export exists.
 AMP logs include scale and skipped updates; only real updates advance the LR schedule, and 50 consecutive skips
 stop training. Step/checkpoint numbers count attempted updates.
+
+## P2: teacher pairs (different driving and target person)
+
+Self-reconstruction cannot teach the identity swap (the driving clip shows the target person), so P2 adds pairs made
+by Wan-Animate-2, as in its own paper: "person B does person A's motion".
+
+| file | does |
+|---|---|
+| `make_teacher_jobs.py` | A = a 33-frame window of one clip (written at 24 fps, 480×832), B = a frame of another clip |
+| `../infer/wan_animate_2_batch.py` | Wan-Animate-2 move mode over all jobs with one loaded model (resumable) |
+| `prep_incontext_ti2v5b.py --teacher jobs.jsonl` | target = [B, teacher frames 1..], drive = A with the self-reconstruction treatment |
+| `run_teacher_pairs.sh` | jobs → generate → prep on one node |
+
+Then `RUN=run_p2 DRIVE_ROPE=offset EXTRA_DATA=cache_teacher MIX="0.6 0.4" bash train/run_pilot_ti2v5b.sh train infer`
+(`train_incontext_ti2v5b.py --data A B --mix 0.6 0.4` draws from both caches by weight).

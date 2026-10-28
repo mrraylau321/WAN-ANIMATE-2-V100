@@ -131,6 +131,28 @@ def make_sample(path, a, rng, generator):
     return out
 
 
+def make_teacher_sample(job, a, rng, generator):
+    """P2 pair from a teacher job (make_teacher_jobs.py + Wan-Animate-2): target = [reference B, teacher frames 1..],
+    drive = A's clip with the same treatment as self-reconstruction. -> (target, drive, meta), or None if the
+    teacher video is missing or too short."""
+    teacher = os.path.join(job["out"], "results.mp4")
+    if not os.path.exists(teacher):
+        return None
+    n = min(video_info(teacher)[0], video_info(job["drive"])[0], a.frames)
+    n = (n - 1) // 4 * 4 + 1
+    if n < 5:
+        return None
+    frames = lambda path: np.stack([cover(f, a.width, a.height) for f in read_frames(path, list(range(n)))])
+    teacher_frames, drive_frames = frames(teacher), frames(job["drive"])
+    ref = cover(cv2.cvtColor(cv2.imread(job["ref"]), cv2.COLOR_BGR2RGB), a.width, a.height)
+    scale = rng.uniform(*a.scale)
+    dx, dy = rng.uniform(-a.max_shift, a.max_shift, 2)
+    drive = destroy_appearance(jitter(drive_frames, scale, dx, dy), generator, getattr(a, "drive_norm", False))
+    meta = dict(src=f"teacher_{job['id']}", window=0, teacher=job["id"], src_a=job.get("src_a", ""),
+                src_b=job.get("src_b", ""), scale=float(scale), dx=float(dx), dy=float(dy))
+    return np.concatenate([ref[None], teacher_frames[1:]]), drive, meta
+
+
 def encode_text(a, device):
     from ti2v5b_replace import encode_prompts, encode_prompts_wan
     if a.t5_wan:
@@ -152,6 +174,7 @@ def check_manifest(a):
     manifest = {k: getattr(a, k) for k in ("width", "height", "frames", "fps", "windows", "ref_gap",
                                           "max_shift", "prompt", "seed")}
     manifest["drive_norm"] = bool(getattr(a, "drive_norm", False))
+    manifest["teacher"] = bool(getattr(a, "teacher", None))
     manifest.update(model=os.path.realpath(a.model), scale=list(a.scale),
                     t5_wan=os.path.realpath(a.t5_wan) if a.t5_wan else None,
                     t5_tokenizer=os.path.realpath(a.t5_tokenizer) if a.t5_tokenizer else None)
@@ -177,7 +200,8 @@ def check_manifest(a):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="Wan2.2-TI2V-5B-Diffusers folder (vae/, text_encoder/, tokenizer/)")
-    p.add_argument("--videos", required=True, help="folder of mp4 clips")
+    p.add_argument("--videos", help="folder of mp4 clips (self-reconstruction samples)")
+    p.add_argument("--teacher", help="jobs.jsonl of make_teacher_jobs.py: build P2 pairs from the teacher videos instead")
     p.add_argument("--list", help="only these clips (file names, one per line, e.g. filter_clips.py select output)")
     p.add_argument("--out", required=True)
     p.add_argument("--width", type=int, default=480)
@@ -199,6 +223,8 @@ def main():
     if (a.frames - 1) % 4:
         p.error("--frames must be 4k + 1")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if a.teacher:
+        a.windows = 1                                    # one sample per teacher video
     os.makedirs(a.out, exist_ok=True)
     check_manifest(a)
     text_path = os.path.join(a.out, "text.pt")
@@ -209,10 +235,16 @@ def main():
     if a.text_only:
         return
 
-    names = [l.strip() for l in open(a.list)] if a.list else sorted(os.path.basename(f) for f in
-                                                                     glob.glob(os.path.join(a.videos, "*.mp4")))
     i, n = (int(x) for x in a.shard.split("/"))
-    names = [x for x in names if x][i::n]
+    if a.teacher:
+        jobs = [json.loads(l) for l in open(a.teacher) if l.strip()][i::n]
+        names = [f"t{j['id']}.job" for j in jobs]
+    else:
+        if not a.videos:
+            p.error("--videos or --teacher is required")
+        names = [l.strip() for l in open(a.list)] if a.list else sorted(os.path.basename(f) for f in
+                                                                         glob.glob(os.path.join(a.videos, "*.mp4")))
+        names = [x for x in names if x][i::n]
     from diffusers import AutoencoderKLWan
     from ti2v5b_replace import vae_encode
     vae = AutoencoderKLWan.from_pretrained(os.path.join(a.model, "vae"), torch_dtype=torch.float32).to(device)
@@ -224,13 +256,18 @@ def main():
         seed = a.seed * 1_000_003 + zlib.crc32(stem.encode()) % 1_000_003
         rng, g = np.random.default_rng(seed), torch.Generator().manual_seed(seed)
         try:
-            samples = make_sample(os.path.join(a.videos, name), a, rng, g)
+            if a.teacher:
+                one = make_teacher_sample(jobs[k], a, rng, g)
+                samples = [one] if one else []
+            else:
+                samples = make_sample(os.path.join(a.videos, name), a, rng, g)
         except Exception as e:  # unreadable clip: report and go on
             print(f"skip {name}: {e}", flush=True)
             skipped += 1
             continue
         if len(samples) < a.windows:
-            print(f"skip {name}: no separated reference/window pair for {a.windows - len(samples)} window(s)", flush=True)
+            why = "teacher video missing or too short" if a.teacher else "no separated reference/window pair"
+            print(f"skip {name}: {why} for {a.windows - len(samples)} window(s)", flush=True)
             skipped += 1
         for target, drive, meta in samples:
             path = os.path.join(a.out, f"{stem}_w{meta['window']}.pt")

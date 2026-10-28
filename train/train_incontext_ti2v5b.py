@@ -135,6 +135,33 @@ class CachedLatents(torch.utils.data.Dataset):
         return s
 
 
+class MixedLatents(torch.utils.data.Dataset):
+    """Several CachedLatents folders drawn by weight, e.g. self-reconstruction 0.6 + teacher pairs 0.4 (the mix does not
+    depend on the folder sizes). Item k is a fixed draw, so a resumed run sees the same sequence."""
+
+    def __init__(self, folders, weights=None, seed=0):
+        self.parts = [CachedLatents(f) for f in folders]
+        weights = list(weights) if weights else [1.0] * len(folders)
+        if len(weights) != len(folders) or min(weights) < 0 or sum(weights) <= 0:
+            raise ValueError(f"--mix needs one non-negative weight per --data folder, got {weights}")
+        self.weights = [w / sum(weights) for w in weights]
+        self.text, self.seed = self.parts[0].text, seed
+        self.folder = "+".join(p.folder for p in self.parts)
+
+    def __len__(self):
+        return sum(len(p) for p in self.parts)
+
+    def __getitem__(self, k):
+        g = torch.Generator().manual_seed(self.seed * 1_000_003 + int(k))
+        part = self.parts[int(torch.multinomial(torch.tensor(self.weights), 1, generator=g))]
+        return part[int(torch.randint(len(part), (1,), generator=g))]
+
+
+def load_data(folders, mix=None, seed=0):
+    """One folder: CachedLatents; several: MixedLatents with weights mix."""
+    return CachedLatents(folders[0]) if len(folders) == 1 else MixedLatents(folders, mix, seed)
+
+
 # ------------------------------------------------------------------ loss
 def flow_loss(model, x0, drive, text, sigma, drive_level, noise, noise_drive, use_checkpoint=False, drive_rope="same"):
     """x0, drive [B, C, F, h, w]; latent frame 0 of x0 is the reference image (kept clean, timestep 0).
@@ -206,6 +233,7 @@ def train(model, dataset, steps, out=None, lr=1e-4, rank_lora=64, shift=5.0, dri
     if steps > total_steps:
         raise ValueError("steps cannot exceed the planned total_steps")
     config = dict(steps=total_steps, rank=rank_lora, lr=lr, drive_noise=list(drive_noise), data=dataset.folder,
+                  mix=getattr(dataset, "weights", None),
                   drive_rope=drive_rope,
                   warmup=warmup, accum=accum, seed=seed, world=world, shift=shift, amp=amp,
                   model=os.path.realpath(model_dir) if model_dir else None, weights=str(next(model.parameters()).dtype))
@@ -316,7 +344,8 @@ def train(model, dataset, steps, out=None, lr=1e-4, rank_lora=64, shift=5.0, dri
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="Wan2.2-TI2V-5B-Diffusers folder (uses its transformer/)")
-    p.add_argument("--data", required=True, help="folder written by prep_incontext_ti2v5b.py")
+    p.add_argument("--data", required=True, nargs="+", help="folder(s) written by prep_incontext_ti2v5b.py")
+    p.add_argument("--mix", type=float, nargs="+", help="sampling weight per --data folder (default equal)")
     p.add_argument("--out", required=True, help="LoRA checkpoints go here")
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -337,7 +366,7 @@ def main():
     dtype = torch.float32 if a.weights == "fp32" else torch.float16
     model = WanTransformer3DModel.from_pretrained(os.path.join(a.model, "transformer"), torch_dtype=dtype)
     log = lambda m: print(f"[rank {rank}] {m}", flush=True)
-    train(model, CachedLatents(a.data), a.steps, a.out, a.lr, a.rank, a.shift, tuple(a.drive_noise), accum=a.accum,
+    train(model, load_data(a.data, a.mix, a.seed), a.steps, a.out, a.lr, a.rank, a.shift, tuple(a.drive_noise), accum=a.accum,
           save_every=a.save_every, seed=a.seed, device=device, amp=device != "cpu", use_checkpoint=device != "cpu",
           rank=rank, world=world, log=log, model_dir=a.model, drive_rope=a.drive_rope)
     if world > 1:

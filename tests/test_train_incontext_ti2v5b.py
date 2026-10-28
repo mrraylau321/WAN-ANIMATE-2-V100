@@ -762,3 +762,91 @@ def test_prep_manifest_records_drive_norm(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", args)                           # same cache without the flag: refused
     with pytest.raises(ValueError, match="drive_norm"):
         prep.main()
+
+
+def test_make_teacher_jobs_writes_inputs_and_resumes(tmp_path, monkeypatch):
+    import json
+    import make_teacher_jobs as mtj
+    vids = tmp_path / "videos"
+    vids.mkdir()
+    for name in ("a.mp4", "b.mp4", "c.mp4"):
+        write_mp4(vids / name, n=40)
+    (tmp_path / "pass.txt").write_text("a.mp4\nb.mp4\nc.mp4\n")
+    args = ["mtj", "--videos", str(vids), "--list", str(tmp_path / "pass.txt"), "--out", str(tmp_path / "t"),
+            "--frames", "9", "--width", "32", "--height", "64"]
+    monkeypatch.setattr(sys, "argv", args + ["--n", "2"])
+    mtj.main()
+    jobs = [json.loads(l) for l in open(tmp_path / "t" / "jobs.jsonl")]
+    assert [j["id"] for j in jobs] == ["00000", "00001"]
+    assert all(j["src_a"] != j["src_b"] for j in jobs)                # A and B come from different clips
+    n, fps = prep.video_info(jobs[0]["drive"])
+    assert n == 9 and abs(fps - 24) < 0.5
+    assert cv2.imread(jobs[0]["ref"]).shape == (64, 32, 3)
+    monkeypatch.setattr(sys, "argv", args + ["--n", "3"])             # resume: the first two jobs are kept as they were
+    mtj.main()
+    jobs3 = [json.loads(l) for l in open(tmp_path / "t" / "jobs.jsonl")]
+    assert len(jobs3) == 3 and jobs3[:2] == jobs
+
+
+def test_prep_teacher_mode_builds_cross_identity_samples(tmp_path, monkeypatch):
+    import json
+    import make_teacher_jobs as mtj
+    vids = tmp_path / "videos"
+    vids.mkdir()
+    for name in ("a.mp4", "b.mp4"):
+        write_mp4(vids / name, n=40)
+    (tmp_path / "pass.txt").write_text("a.mp4\nb.mp4\n")
+    monkeypatch.setattr(sys, "argv", ["mtj", "--videos", str(vids), "--list", str(tmp_path / "pass.txt"), "--out",
+                                      str(tmp_path / "t"), "--frames", "9", "--width", "32", "--height", "64", "--n", "2"])
+    mtj.main()
+    jobs = [json.loads(l) for l in open(tmp_path / "t" / "jobs.jsonl")]
+    os.makedirs(jobs[0]["out"])
+    write_mp4(os.path.join(jobs[0]["out"], "results.mp4"), n=9, w=32, h=64)   # a fake teacher video for job 0 only
+    model_dir = tmp_path / "ti2v"
+    tiny_vae().save_pretrained(str(model_dir / "vae"))
+    monkeypatch.setattr(prep, "encode_text", lambda *_: dict(text=torch.randn(1, 7, 16), neg=torch.randn(1, 7, 16)))
+    monkeypatch.setattr(sys, "argv", ["prep", "--model", str(model_dir), "--teacher", str(tmp_path / "t" / "jobs.jsonl"),
+                                      "--out", str(tmp_path / "tc"), "--width", "32", "--height", "64", "--frames", "9"])
+    prep.main()
+    files = sorted(p.name for p in (tmp_path / "tc").glob("t*_w0.pt"))
+    assert files == ["t00000_w0.pt"]                                  # job 1 has no teacher video yet: skipped
+    s = torch.load(tmp_path / "tc" / "t00000_w0.pt", weights_only=True)
+    assert s["target"].shape == s["drive"].shape == (48, 3, 4, 2)
+    assert s["meta"]["teacher"] == "00000" and json.load(open(tmp_path / "tc" / "manifest.json"))["teacher"] is True
+
+
+def test_mixed_latents_follow_the_weights(tmp_path):
+    write_cache(tmp_path / "a", n=2)
+    write_cache(tmp_path / "b", n=5)
+    mix = tt.MixedLatents([str(tmp_path / "a"), str(tmp_path / "b")], [0.8, 0.2])
+    assert len(mix) == 7 and mix.weights == [0.8, 0.2]
+    srcs = [mix[k]["meta"]["src"] for k in range(400)]
+    from_a = sum(s in ("c0.mp4", "c1.mp4") for s in srcs) / 400
+    assert 0.65 < from_a < 0.95                                       # cache a is the smaller one, still drawn ~80 %
+    assert [mix[k]["meta"]["src"] for k in range(20)] == srcs[:20]    # fixed draws (resume-safe)
+    with pytest.raises(ValueError):
+        tt.MixedLatents([str(tmp_path / "a"), str(tmp_path / "b")], [1.0])
+    hist = tt.train(tiny_transformer(), mix, steps=2, log=lambda *_: None)
+    assert np.isfinite(hist).all()
+
+
+def test_batch_runner_skips_finished_jobs(tmp_path, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("wab", os.path.join(REPO, "infer", "wan_animate_2_batch.py"))
+    wab = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "core", __import__("types").SimpleNamespace(build_object_from_config_file=None))
+    spec.loader.exec_module(wab)
+    jobs = [dict(id=f"{k:05d}", ref=f"r{k}.png", drive=f"d{k}.mp4", out=str(tmp_path / f"{k:05d}")) for k in range(3)]
+    os.makedirs(jobs[1]["out"])
+    open(os.path.join(jobs[1]["out"], "results.mp4"), "w").close()
+    calls = []
+
+    def fake_pipeline(**kw):
+        calls.append(kw)
+        open(os.path.join(kw["output_path"], "results.mp4"), "w").close()
+    a = __import__("types").SimpleNamespace(width=32, height=64, fps=24, seed=42, clip_len=9, sample_guide_scale=1.0,
+                                            step=2, prompt="p", prompt_ref="r")
+    wab.run_jobs(fake_pipeline, jobs, a, log=lambda *_: None)
+    assert [c["output_path"] for c in calls] == [jobs[0]["out"], jobs[2]["out"]]
+    assert calls[1]["seed"] == 44 and calls[0]["clip_len"] == 9
+    assert wab.pending(jobs) == []

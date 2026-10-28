@@ -13,6 +13,8 @@
 #   RUN=run_offset DRIVE_ROPE=offset  a second experiment in its own run folder (train + infer use both)
 #   CACHE=cache_norm DRIVE_NORM=1     a cache whose driving clips get per-frame brightness normalisation
 #                                     (prep + infer); a new cache folder, because the setting is in its manifest
+#   EXTRA_DATA=cache_teacher MIX="0.6 0.4"  also train on a second cache (P2 teacher pairs from
+#                                     run_teacher_pairs.sh), drawn with these weights
 #   WEIGHTS=fp16  frozen weights stored in fp16 (10 GB instead of 20 GB per GPU) if train/infer runs out of memory
 set -euo pipefail
 pids=()
@@ -98,7 +100,7 @@ for stage in $STAGES; do
       if [[ -f $last ]]; then echo "== train: $last exists, skipped"; continue; fi
       echo "== train: $STEPS steps on $N GPUs (log $WORK/train.log)"
       CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node "$N" --master_port "${MASTER_PORT:-29531}" \
-        train/train_incontext_ti2v5b.py --model "$CKPT_5B" --data "$WORK/$CACHE" --out "$WORK/$RUN" --steps "$STEPS" ${WEIGHTS:+--weights "$WEIGHTS"} ${DRIVE_ROPE:+--drive-rope "$DRIVE_ROPE"} \
+        train/train_incontext_ti2v5b.py --model "$CKPT_5B" --data "$WORK/$CACHE" ${EXTRA_DATA:+"$WORK/$EXTRA_DATA"} ${MIX:+--mix $MIX} --out "$WORK/$RUN" --steps "$STEPS" ${WEIGHTS:+--weights "$WEIGHTS"} ${DRIVE_ROPE:+--drive-rope "$DRIVE_ROPE"} \
         2>&1 | tee -a "$WORK/train.log" ;;
     infer)
       lora=$(ls "$WORK/$RUN"/lora_*.safetensors 2>/dev/null | tail -1 || true)
