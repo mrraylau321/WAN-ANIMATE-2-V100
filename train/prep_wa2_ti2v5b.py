@@ -140,14 +140,20 @@ def check_manifest(a, names):
     path = os.path.join(a.out, "manifest.json")
     with open(os.path.join(a.out, ".manifest.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        old = None
         if os.path.exists(path):
             with open(path) as fh:
                 old = json.load(fh)
-            if old != manifest:
+        samples = glob.glob(os.path.join(a.out, "samples", "*.pt"))
+        if old is None and (samples or glob.glob(os.path.join(a.out, "*.pt"))):
+            raise ValueError("unversioned cache: use a new cache directory")
+        if old not in (None, manifest):
+            if samples:
                 raise ValueError("cache manifest differs: use a new cache directory")
-        else:
-            if glob.glob(os.path.join(a.out, "*.pt")) or glob.glob(os.path.join(a.out, "samples", "*.pt")):
-                raise ValueError("unversioned cache: use a new cache directory")
+            # no sample yet (an earlier run stopped before its first one): start this cache over
+            if os.path.exists(os.path.join(a.out, "text.pt")):
+                os.remove(os.path.join(a.out, "text.pt"))
+        if old != manifest:
             tmp = os.path.join(a.out, f".tmp_manifest.{os.getpid()}")
             with open(tmp, "w") as fh:
                 json.dump(manifest, fh, indent=2)

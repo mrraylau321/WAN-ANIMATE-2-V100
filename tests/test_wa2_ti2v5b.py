@@ -320,6 +320,25 @@ def test_cache_versions_refuse_each_other(tmp_path):
         pilot.CachedLatents(tmp_path / "new")
 
 
+def test_changed_manifest_restarts_only_an_empty_cache(tmp_path):
+    out = tmp_path / "cache"
+    out.mkdir()
+    def args(gdino):
+        return types.SimpleNamespace(fps=24.0, windows=2, blur_sigma=2.0, prompt="p", seed=0,
+                                     model=str(tmp_path / "model"), gdino=gdino, sam2="sam2", videos=None,
+                                     t5_wan=None, t5_tokenizer=None, out=str(out))
+    prep.check_manifest(args("hf-id"), ["a.mp4"])
+    (out / "text.pt").write_bytes(b"old")
+    prep.check_manifest(args("local/grounding-dino-base"), ["a.mp4"])  # failed run left only a manifest + text
+    assert not (out / "text.pt").exists()
+    assert json.loads((out / "manifest.json").read_text())["gdino"]["path"].endswith("local/grounding-dino-base")
+    (out / "samples").mkdir()
+    (out / "samples" / "a_w0.pt").write_bytes(b"x")
+    with pytest.raises(ValueError, match="differs"):
+        prep.check_manifest(args("hf-id"), ["a.mp4"])
+    prep.check_manifest(args("local/grounding-dino-base"), ["a.mp4"])
+
+
 def test_windows_match_pilot_all_windows(monkeypatch):
     monkeypatch.setattr(prep, "video_info", lambda path: (300, 24.0))
     monkeypatch.setattr(pilot_prep, "video_info", lambda path: (300, 24.0))
