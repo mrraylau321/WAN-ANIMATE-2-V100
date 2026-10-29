@@ -7,7 +7,9 @@
 #   ref_beach_girl.jpg  ref_pink_girl.jpg  drive_beach_jump.mp4  drive_beach_kick.mp4  drive_heart_hands.mp4
 # Output: ~/ray_runs/move/<case>/<session>/results.mp4, plus a copy at ~/ray_runs/move/<case>.mp4
 # Box: 4x V100 32GB -> GPUS=0,1,2,3, MODE=distill, bf16 DiT shards (same settings as scripts/run_v100_replace.sh).
-# Knobs (env): IN CKPT_DIR GPUS MODE RES PROMPT (default " " = no prompt) SEED
+# Knobs (env): IN CKPT_DIR GPUS MODE RES PROMPT (default " " = no prompt) SEED CLIP_LEN
+# CLIP_LEN=41: frames per generated clip; longer drives are split into clips. 4x32GB fits 41 frames at 480p,
+# 73 (a 2.9 s drive at 24 fps) runs out of memory.
 set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ENV_PREFIX=${ENV_PREFIX:-/home/ma-user/anaconda3/envs/wan_animate_2}
@@ -16,7 +18,7 @@ IN=${IN:-$REPO/inputs/move_mode}
 export CKPT_DIR=${CKPT_DIR:-/home/ma-user/work/l00996894/ckpts}
 export GPUS=${GPUS:-0,1,2,3} MODE=${MODE:-distill} RES=${RES:-480p} MASTER_PORT=${MASTER_PORT:-29517}
 export EXTRA_OVERRIDES="test_cfg.dit_shard_dtype=bf16 test_cfg.log_gpu_memory=true ${EXTRA_OVERRIDES:-}"
-export PROMPT=${PROMPT:- }
+export PROMPT=${PROMPT:- } CLIP_LEN=${CLIP_LEN:-41}
 OUT=${OUT:-$HOME/ray_runs/move}
 
 # case name | reference photo | driving clip
