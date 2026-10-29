@@ -77,3 +77,34 @@ by Wan-Animate-2, as in its own paper: "person B does person A's motion".
 
 Then `RUN=run_p2 DRIVE_ROPE=offset EXTRA_DATA=cache_teacher MIX="0.6 0.4" bash train/run_pilot_ti2v5b.sh train infer`
 (`train_incontext_ti2v5b.py --data A B --mix 0.6 0.4` draws from both caches by weight).
+
+## WA2 shared-QKV port to TI2V-5B
+
+`wa2_ti2v5b.py` runs a clean driving pass at embedding timestep 1, then a generation pass through the same blocks.
+Generation frame 0 is the clean reference; frames 1–8 retrieve their aligned driving frame in one attention softmax.
+Driving positions have a width offset of 15 tokens. Only the 180 self-attention Q/K/V tensors train (849,623,040
+parameters). Frozen weights default to fp16, QKV stays fp32, and multi-GPU training shards Adam state with ZeRO.
+Both passes checkpoint every block. Full-step V100 memory and learning quality still need hardware validation.
+
+Prep jointly encodes `[reference, clip[1:]]` as the target and encodes the original clip as driving. GDINO/SAM2 person
+masks select a deterministic latent Gaussian blur (sigma 2, one-cell mask dilation). No driving noise or pixel
+augmentation is added. Frame 0 is conditioning, not reconstruction. The new versioned cache keeps samples under
+`samples/`; the pilot and WA2 loaders refuse each other's caches. `REUSE_TARGET=cache` can reuse matching pilot
+targets; the drive is always re-encoded. All model/tokenizer/mask checkpoints must already be local (GDINO/SAM2 default
+to `$CKPT_DIR/grounding-dino-base` and `$CKPT_DIR/sam2.1-hiera-large`, else the HF ids in the local HF cache). The
+last `HOLDOUT=4` clips of `pass.txt` are kept out of training (`wa2_holdout.txt`) for the evaluation below.
+
+Reuse `$WORK/pass.txt` from the pilot's filter/select stages, then run:
+
+```bash
+bash train/run_wa2_ti2v5b.sh prep train infer      # defaults: 4x V100, /cache paths as in run_pilot_ti2v5b.sh
+```
+
+The fixed layout is 33 frames at 480×832 (9×26×15 tokens per branch). `T5_WAN`/`T5_TOKENIZER` select the existing
+local Wan-format text encoder. Prep writes `PREVIEW=4` videos `$WORK/$CACHE/preview_*.mp4` (mask overlay | decoded
+blurred drive): check them before training. Training resumes from `state.pt` and exports `qkv_*.safetensors`.
+Inference uses conditional Euler (guide 1) and writes raw and `drive-blurred | output` videos. The launcher's infer
+stage tests the latest QKV in-domain, on one held-out clip and on one training clip, with the reference taken from the
+clip itself 1 s after the window (as in training). Each clip gets four controls: `drive` (its own blurred driving),
+`none` (`--no-drive`), `reverse` (`--reverse-drive`) and `wrong` (`--drive-clip` of another clip). Learned motion
+means `drive` follows the clip while `reverse`/`wrong` follow their own driving and `none` does not.
