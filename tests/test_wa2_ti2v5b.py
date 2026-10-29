@@ -580,7 +580,7 @@ def launcher_env(tmp_path):
     (work / "pass.txt").write_text("a.mp4\nb.mp4\n\nc.mp4\n")
     (root / "ckpts/sam2.1-hiera-large").mkdir(parents=True)
     env = dict(os.environ, WORK=str(work), CKPT_5B=str(tmp_path / "model"), VIDEOS=str(tmp_path / "videos"),
-               HOLDOUT="2", CKPT_DIR=str(tmp_path / "ckpts"),
+               HOLDOUT="2", CKPT_DIR=str(tmp_path / "ckpts"), SYNC_TO="obs://bucket/run_wa2",
                GPUS="0,1", ENV_PREFIX=str(binary.parent), STEPS="4", RUN="run_wa2", CACHE="cache_wa2",
                WEIGHTS="fp16", BLUR_SIGMA="2.0", T5_WAN=str(tmp_path / "t5.pth"),
                T5_TOKENIZER=str(tmp_path / "tokenizer"), REUSE_TARGET="old_cache", FRAMES="33")
@@ -621,6 +621,8 @@ if "train/train_wa2_ti2v5b.py" in sys.argv:
     assert all(str(work / "old_cache") in c["argv"] for c in prep_calls[1:])
     training = next(c for c in calls if "train/train_wa2_ti2v5b.py" in c["argv"])
     assert training["gpu"] == "0,1" and "--nproc_per_node" in training["argv"]
+    assert training["argv"][training["argv"].index("--sync-to") + 1] == "obs://bucket/run_wa2"
+    assert training["argv"][training["argv"].index("--save-every") + 1] == "500"
     inference = [c for c in calls if "train/infer_wa2_ti2v5b.py" in c["argv"]]
     assert len(inference) == 8 and all("--ref-from-drive" in c["argv"] for c in inference)
     assert {c["gpu"] for c in inference} == {"0", "1"}
@@ -713,6 +715,55 @@ def test_fp16_storage_keeps_only_qkv_fp32(tmp_path):
     train.train(model, dataset, 0, log=lambda *_: None)
     for name, param in model.named_parameters():
         assert param.dtype == (torch.float32 if wa.QKV_NAME.fullmatch(name) else torch.float16)
+
+
+def test_sync_uploads_every_save_and_a_fresh_machine_resumes(tmp_path):
+    dataset, remote = write_cache(tmp_path / "cache"), tmp_path / "bucket"
+    logs = []
+    train.train(tiny_transformer(), dataset, 4, out=tmp_path / "a", save_every=2, sync_to=str(remote),
+                log=logs.append)
+    assert sorted(os.listdir(remote)) == ["qkv_000002.safetensors", "qkv_000004.safetensors", "state.pt"]
+    assert torch.load(remote / "state.pt", weights_only=True)["step"] == 4
+    assert sum("synced" in m for m in logs) == 2
+    fresh = tmp_path / "fresh"
+    assert train.restore_state(str(fresh), str(remote)) and not train.restore_state(str(fresh), str(remote))
+    assert (fresh / "state.pt").read_bytes() == (remote / "state.pt").read_bytes()
+    split = tmp_path / "split"
+    train.train(tiny_transformer(), dataset, 2, out=split, total_steps=4, save_every=2, sync_to=str(tmp_path / "b2"),
+                log=lambda *_: None)
+    (split / "state.pt").unlink()
+    for f in split.glob("qkv_*"):
+        f.unlink()
+    assert train.restore_state(str(split), str(tmp_path / "b2"))
+    resumed = tiny_transformer()
+    train.train(resumed, dataset, 4, out=split, save_every=2, log=lambda *_: None)
+    whole = tiny_transformer()
+    train.train(whole, dataset, 4, out=tmp_path / "whole", save_every=2, log=lambda *_: None)
+    for name, p in train.qkv_state_dict(whole).items():
+        torch.testing.assert_close(train.qkv_state_dict(resumed)[name], p, atol=0, rtol=0)
+
+
+def test_sync_failure_is_reported_not_fatal(tmp_path):
+    dataset = write_cache(tmp_path / "cache")
+    (tmp_path / "not_a_dir").write_text("x")
+    logs = []
+    history = train.train(tiny_transformer(), dataset, 2, out=tmp_path / "run", save_every=2,
+                          sync_to=str(tmp_path / "not_a_dir"), log=logs.append)
+    assert len(history) == 2 and (tmp_path / "run/state.pt").exists()
+    assert any("FAILED" in m for m in logs)
+
+
+def test_obs_paths_go_through_moxing(monkeypatch, tmp_path):
+    calls = []
+    fake = types.SimpleNamespace(file=types.SimpleNamespace(copy=lambda a, b: calls.append(("copy", a, b)),
+                                                            exists=lambda a: calls.append(("exists", a)) or True))
+    monkeypatch.setitem(sys.modules, "moxing", fake)
+    train.copy_file(str(tmp_path / "state.pt"), "obs://bucket/run/state.pt")
+    assert train.exists("obs://bucket/run/state.pt")
+    assert train.restore_state(str(tmp_path / "new"), "obs://bucket/run/")
+    assert calls == [("copy", str(tmp_path / "state.pt"), "obs://bucket/run/state.pt"),
+                     ("exists", "obs://bucket/run/state.pt"), ("exists", "obs://bucket/run/state.pt"),
+                     ("copy", "obs://bucket/run/state.pt", str(tmp_path / "new/state.pt"))]
 
 
 def test_qkv_export_load_and_base_identity(tmp_path):

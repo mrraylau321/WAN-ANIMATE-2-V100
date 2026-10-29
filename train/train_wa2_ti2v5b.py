@@ -4,6 +4,8 @@ import glob
 import json
 import math
 import os
+import shutil
+import threading
 import time
 
 import torch
@@ -50,10 +52,54 @@ def save_training_state(out, state):
     export_qkv(state["qkv"], out, state["step"], state["config"])
 
 
+def copy_file(src, dst):
+    """One file between a folder and a folder or obs:// (ModelArts MoXing, preinstalled in ModelArts images)."""
+    if src.startswith("obs://") or dst.startswith("obs://"):
+        import moxing as mox
+        mox.file.copy(src, dst)
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+    shutil.copyfile(src, dst + ".tmp")
+    os.replace(dst + ".tmp", dst)
+
+
+def exists(path):
+    if path.startswith("obs://"):
+        import moxing as mox
+        return mox.file.exists(path)
+    return os.path.exists(path)
+
+
+def upload(out, sync_to, names, log=print):
+    """Copy what a save just wrote to sync_to in the background: the ranks keep training meanwhile. A failed upload
+    is reported, not fatal (the local copy is intact)."""
+    def run():
+        for name in names:
+            try:
+                copy_file(os.path.join(out, name), f"{sync_to.rstrip('/')}/{name}")
+            except Exception as exc:  # noqa: BLE001 (network/OBS errors must not stop training)
+                log(f"sync of {name} to {sync_to} FAILED: {exc!r} (training continues; local copy in {out})")
+                return
+        log(f"synced {', '.join(names)} -> {sync_to}")
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread
+
+
+def restore_state(out, sync_to):
+    """A fresh machine: fetch state.pt from sync_to, so train() resumes where the synced run stopped."""
+    local, remote = os.path.join(out, "state.pt"), f"{sync_to.rstrip('/')}/state.pt"
+    if os.path.exists(local) or not exists(remote):
+        return False
+    copy_file(remote, local)
+    return True
+
+
 def train(model, dataset, steps, out=None, lr=1e-4, shift=5.0, warmup=50, accum=1, log_every=10,
           save_every=250, seed=0, device="cpu", amp=False, use_checkpoint=True, rank=0, world=1,
-          log=print, total_steps=None, model_dir=None):
-    """Resume the same sample/RNG cursor; total_steps keeps a split run's original schedule."""
+          log=print, total_steps=None, model_dir=None, sync_to=None):
+    """Resume the same sample/RNG cursor; total_steps keeps a split run's original schedule. sync_to: after every
+    save, state.pt and that step's QKV export are also copied there (obs:// or a folder)."""
     total_steps = steps if total_steps is None else total_steps
     if steps > total_steps:
         raise ValueError("steps cannot exceed total_steps")
@@ -108,7 +154,7 @@ def train(model, dataset, steps, out=None, lr=1e-4, shift=5.0, warmup=50, accum=
         log(f"{len(dataset)} samples, {world} ranks x {accum} accum, amp {amp}, checkpoint {use_checkpoint}")
         if start:
             log(f"resuming step {start}, sample cursor {cursor}")
-    history, t0 = [], time.time()
+    history, t0, uploading = [], time.time(), None
     for step in range(start + 1, steps + 1):
         opt.zero_grad(set_to_none=True)
         step_loss = 0.0
@@ -164,13 +210,19 @@ def train(model, dataset, steps, out=None, lr=1e-4, shift=5.0, warmup=50, accum=
             else:
                 rngs[0] = rng
             if rank == 0:
+                if uploading:
+                    uploading.join()  # never replace state.pt while the previous one is still uploading
                 state = dict(config=config, qkv=qkv_state_dict(model), optimizer=opt.state_dict(),
                              scheduler=sched.state_dict(), scaler=scaler.state_dict(), step=step, cursor=cursor,
                              rng=rngs, skipped=skipped, skip_streak=skip_streak)
                 save_training_state(out, state)
                 del state
+                if sync_to:
+                    uploading = upload(out, sync_to, ["state.pt", f"qkv_{step:06d}.safetensors"], log)
             if world > 1:
                 dist.barrier(device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None)
+    if uploading:
+        uploading.join()
     return history
 
 
@@ -186,9 +238,15 @@ def main():
     p.add_argument("--save-every", type=int, default=500, help="state.pt ~10 GB + a 3.4 GB QKV export each time")
     p.add_argument("--weights", choices=["fp16", "fp32"], default="fp16")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--sync-to", help="obs://bucket/path (MoXing) or a folder: each save is copied there, and a fresh "
+                                     "machine without --out/state.pt resumes from it")
     a = p.parse_args()
     os.environ["HF_HUB_OFFLINE"] = os.environ["TRANSFORMERS_OFFLINE"] = "1"
     rank, world = setup_dist()
+    if a.sync_to and int(os.environ.get("LOCAL_RANK", rank)) == 0 and restore_state(a.out, a.sync_to):
+        print(f"[rank {rank}] restored {a.out}/state.pt from {a.sync_to}", flush=True)
+    if world > 1:  # every rank reads state.pt only after it is there
+        dist.barrier(device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None)
     device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
     from diffusers import WanTransformer3DModel
     # fp32 load, as in the pilot (fp16 from_pretrained needs accelerate), then fp16 storage
@@ -201,7 +259,7 @@ def main():
     log = lambda msg: print(f"[rank {rank}] {msg}", flush=True)
     train(model, CachedLatents(a.data), a.steps, a.out, lr=a.lr, shift=a.shift, accum=a.accum,
           save_every=a.save_every, seed=a.seed, device=device, amp=device != "cpu", use_checkpoint=True,
-          rank=rank, world=world, log=log, model_dir=a.model)
+          rank=rank, world=world, log=log, model_dir=a.model, sync_to=a.sync_to)
     if world > 1:
         dist.destroy_process_group()
 

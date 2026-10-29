@@ -9,6 +9,8 @@
 #        controls: drive | none (no driving) | reverse (time-reversed driving) | wrong (another clip's driving)
 #        -> $WORK/infer_wa2/<held|train>_<clip>_<control>.mp4 (+ _side.mp4 = blurred drive | output), 4 runs at a time
 # Knobs (env): VIDEOS CKPT_5B CKPT_DIR GDINO SAM2 WORK GPUS STEPS RUN CACHE WEIGHTS BLUR_SIGMA HOLDOUT PREVIEW REUSE_TARGET
+#   SAVE_EVERY (500) SYNC_TO (obs://bucket/path: every save is also copied there with MoXing; a fresh machine resumes
+#   from it)
 #   T5_WAN T5_TOKENIZER MASTER_PORT
 set -euo pipefail
 pids=()
@@ -126,7 +128,8 @@ for stage in $STAGES; do
       if [[ -f $last ]]; then echo "== train: $last exists, skipped"; continue; fi
       CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node "$N" --master_port "${MASTER_PORT:-29532}" \
         train/train_wa2_ti2v5b.py --model "$CKPT_5B" --data "$WORK/$CACHE" --out "$WORK/$RUN" \
-        --steps "$STEPS" --weights "$WEIGHTS" 2>&1 | tee -a "$WORK/train_wa2.log" ;;
+        --steps "$STEPS" --weights "$WEIGHTS" --save-every "${SAVE_EVERY:-500}" ${SYNC_TO:+--sync-to "$SYNC_TO"} \
+        2>&1 | tee -a "$WORK/train_wa2.log" ;;
     infer)
       qkv=$(ls "$WORK/$RUN"/qkv_*.safetensors 2>/dev/null | tail -1 || true)
       [[ -n $qkv ]] || { echo "no QKV in $WORK/$RUN: run train first" >&2; exit 1; }

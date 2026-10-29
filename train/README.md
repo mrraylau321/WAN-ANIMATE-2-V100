@@ -102,7 +102,9 @@ bash train/run_wa2_ti2v5b.sh prep train infer      # defaults: 4x V100, /cache p
 
 The fixed layout is 33 frames at 480×832 (9×26×15 tokens per branch). `T5_WAN`/`T5_TOKENIZER` select the existing
 local Wan-format text encoder. Prep writes `PREVIEW=4` videos `$WORK/$CACHE/preview_*.mp4` (mask overlay | decoded
-blurred drive): check them before training. Training resumes from `state.pt` and exports `qkv_*.safetensors`.
+blurred drive): check them before training. Training resumes from `state.pt` and exports `qkv_*.safetensors` every `SAVE_EVERY=500` steps (~1 epoch on 4 GPUs).
+`SYNC_TO=obs://bucket/path` also copies each save there with ModelArts MoXing, in the background (a failed upload is
+logged, training goes on); a fresh machine with an empty `$WORK/$RUN` first fetches `state.pt` from it and resumes.
 Inference uses conditional Euler (guide 1) and writes raw and `drive-blurred | output` videos. The launcher's infer
 stage tests the latest QKV in-domain, on one held-out clip and on one training clip, with the reference taken from the
 clip itself 1 s after the window (as in training). Each clip gets four controls: `drive` (its own blurred driving),
