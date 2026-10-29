@@ -117,6 +117,7 @@ for stage in $STAGES; do
       CUDA_VISIBLE_DEVICES=${GPU[0]} python train/prep_wa2_ti2v5b.py --model "$CKPT_5B" --videos "$VIDEOS" \
         --list "$WORK/wa2_train.txt" --out "$WORK/$CACHE" --frames "$FRAMES" --blur-sigma "$BLUR_SIGMA" \
         --gdino "$GDINO" --sam2 "$SAM2" --text-only ${T5[@]+"${T5[@]}"}
+      echo "== prep: $(grep -c . "$WORK/wa2_train.txt") clips on $N GPUs -> $WORK/$CACHE/samples (progress: tail -f $WORK/prep_wa2_ti2v5b_0.log)"
       shards python train/prep_wa2_ti2v5b.py --model "$CKPT_5B" --videos "$VIDEOS" --list "$WORK/wa2_train.txt" \
         --out "$WORK/$CACHE" --frames "$FRAMES" --blur-sigma "$BLUR_SIGMA" --gdino "$GDINO" --sam2 "$SAM2" \
         --preview "$PREVIEW" ${T5[@]+"${T5[@]}"} ${REUSE[@]+"${REUSE[@]}"} ;;

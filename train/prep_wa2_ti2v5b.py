@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+import time
 import zlib
 
 import cv2
@@ -229,7 +230,8 @@ def main():
     sample_dir = os.path.join(a.out, "samples")
     os.makedirs(sample_dir, exist_ok=True)
     done = skipped = empty = reused = previews = 0
-    for name in names[shard::shards]:
+    mine, t0 = names[shard::shards], time.time()
+    for k, name in enumerate(mine, 1):
         stem = os.path.splitext(name)[0]
         seed = a.seed * 1_000_003 + zlib.crc32(stem.encode()) % 1_000_003
         count = 0
@@ -259,6 +261,10 @@ def main():
                 write_video(os.path.join(a.out, f"preview_{previews}.mp4"), preview, a.fps)
                 previews += 1
         skipped += a.windows - count
+        if k % 10 == 0 or k == len(mine):
+            rate = (time.time() - t0) / k
+            print(f"shard {a.shard}: {k}/{len(mine)} clips, {done} new samples, {empty} empty-mask skips, "
+                  f"{rate:.0f} s/clip, ~{rate * (len(mine) - k) / 3600:.1f} h left", flush=True)
     print(f"shard {a.shard}: {done} samples, {reused} reused targets, {empty} empty-mask skips, "
           f"{skipped} missing-window skips -> {a.out}", flush=True)
 
