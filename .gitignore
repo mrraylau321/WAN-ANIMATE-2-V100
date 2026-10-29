@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 __pycache__/
 *.pyc
+
+# user inputs (personal photos, downloaded clips) never go into this public repo
+inputs/
