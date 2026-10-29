@@ -106,7 +106,8 @@ blurred drive): check them before training. Training resumes from `state.pt` and
 `SYNC_TO=obs://bucket/path` also copies each save there with ModelArts MoXing, in the background (a failed upload is
 logged, training goes on); a fresh machine with an empty `$WORK/$RUN` first fetches `state.pt` from it and resumes.
 Inference uses conditional Euler (guide 1) and writes raw and `drive-blurred | output` videos. The launcher's infer
-stage tests the latest QKV in-domain, on one held-out clip and on one training clip, with the reference taken from the
+stage tests the latest QKV in-domain, on the held-out clip and the training clip that move most (the pilot filter's
+motion score in `$WORK/scores_*.csv`), with the reference taken from the
 clip itself 1 s after the window (as in training). Each clip gets four controls: `drive` (its own blurred driving),
 `none` (`--no-drive`), `reverse` (`--reverse-drive`) and `wrong` (`--drive-clip` of another clip). Learned motion
 means `drive` follows the clip while `reverse`/`wrong` follow their own driving and `none` does not.

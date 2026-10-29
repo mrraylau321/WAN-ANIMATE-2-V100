@@ -5,7 +5,8 @@
 #        target = VAE(ref + clip[1:]) and drive = person-blurred VAE(clip) on every GPU -> $WORK/$CACHE
 #        (+ PREVIEW=4 videos $WORK/$CACHE/preview_*.mp4: mask overlay | decoded blurred drive; look before training)
 # train  torchrun on all GPUs -> $WORK/$RUN/qkv_<step>.safetensors
-# infer  latest QKV on a held-out clip and on a training clip, reference = the clip's own frame 1 s after the window;
+# infer  latest QKV on the most-moving held-out clip and the most-moving training clip (the pilot filter's motion score,
+#        $WORK/scores_*.csv), reference = the clip's own frame 1 s after the window;
 #        controls: drive | none (no driving) | reverse (time-reversed driving) | wrong (another clip's driving)
 #        -> $WORK/infer_wa2/<held|train>_<clip>_<control>.mp4 (+ _side.mp4 = blurred drive | output), 4 runs at a time
 # Knobs (env): VIDEOS CKPT_5B CKPT_DIR GDINO SAM2 WORK GPUS STEPS RUN CACHE WEIGHTS BLUR_SIGMA HOLDOUT PREVIEW REUSE_TARGET
@@ -73,6 +74,14 @@ shards() {
   done
   wait_all
 }
+moving() {  # list n: the n clips of the list that move most (filter_clips.py motion score; list order without scores)
+  python - "$1" "$2" "$WORK"/scores_*.csv <<'PY'
+import csv, os, sys
+names = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+motion = {r["name"]: float(r["motion"]) for f in sys.argv[3:] if os.path.exists(f) for r in csv.DictReader(open(f))}
+print("\n".join(sorted(names, key=lambda n: -motion.get(n, 0.0))[:int(sys.argv[2])]))
+PY
+}
 runs=0
 infer_clip() {  # kind clip other: the four controls of one clip, one GPU each
   local kind=$1 clip=$2 other=$3 control name
@@ -134,8 +143,8 @@ for stage in $STAGES; do
       qkv=$(ls "$WORK/$RUN"/qkv_*.safetensors 2>/dev/null | tail -1 || true)
       [[ -n $qkv ]] || { echo "no QKV in $WORK/$RUN: run train first" >&2; exit 1; }
       [[ -f $WORK/wa2_holdout.txt && -f $WORK/wa2_train.txt ]] || { echo "run prep first (no holdout split)" >&2; exit 1; }
-      held=$(sed -n 1p "$WORK/wa2_holdout.txt"); held2=$(sed -n 2p "$WORK/wa2_holdout.txt")
-      seen=$(sed -n 1p "$WORK/wa2_train.txt")
+      held=$(moving "$WORK/wa2_holdout.txt" 2 | sed -n 1p); held2=$(moving "$WORK/wa2_holdout.txt" 2 | sed -n 2p)
+      seen=$(moving "$WORK/wa2_train.txt" 1)
       mkdir -p "$WORK/infer_wa2"
       echo "== infer $qkv: held-out $held, training clip $seen -> $WORK/infer_wa2"
       infer_clip held "$held" "$held2"

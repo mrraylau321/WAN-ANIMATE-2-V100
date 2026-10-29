@@ -590,6 +590,8 @@ def launcher_env(tmp_path):
 def test_launcher_stubbed_stages_and_resume(tmp_path):
     script, work, binary, env = launcher_env(tmp_path)
     stub = f"#!{sys.executable}\n" + '''import json, os, sys
+if sys.argv[1:2] == ["-"]:  # the launcher's own inline helpers run for real
+    os.execv(sys.executable, [sys.executable] + sys.argv[1:])
 from pathlib import Path
 work = Path(os.environ["WORK"])
 with open(work / "calls.jsonl", "a") as f:
@@ -603,6 +605,8 @@ if "train/train_wa2_ti2v5b.py" in sys.argv:
     for name in ("python", "torchrun"):
         (binary / name).write_text(stub)
         (binary / name).chmod(0o755)
+    (work / "scores_0.csv").write_text("name,frames,fps,person_frac,multi_frac,height,motion\n"
+                                       "a.mp4,1,24,1,0,0.5,0.2\nb.mp4,1,24,1,0,0.5,0.1\nc.mp4,1,24,1,0,0.5,0.5\n")
     result = subprocess.run(["/bin/bash", str(script), "prep", "train", "infer"], env=env, capture_output=True,
                             text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -628,12 +632,13 @@ if "train/train_wa2_ti2v5b.py" in sys.argv:
     assert {c["gpu"] for c in inference} == {"0", "1"}
     arg = lambda c, flag: c["argv"][c["argv"].index(flag) + 1] if flag in c["argv"] else None
     names = {arg(c, "--name"): c for c in inference}
-    assert set(names) == {f"{kind}_{clip}_{control}" for kind, clip in (("held", "b"), ("train", "a"))
+    # held-out b, c: c moves most (scores_0.csv) -> held c, its wrong drive b; the training clip a
+    assert set(names) == {f"{kind}_{clip}_{control}" for kind, clip in (("held", "c"), ("train", "a"))
                           for control in ("drive", "none", "reverse", "wrong")}
-    assert arg(names["held_b_drive"], "--drive").endswith("videos/b.mp4")
-    assert arg(names["held_b_wrong"], "--drive-clip").endswith("videos/c.mp4")
-    assert arg(names["train_a_wrong"], "--drive-clip").endswith("videos/b.mp4")
-    assert "--no-drive" in names["held_b_none"]["argv"] and "--reverse-drive" in names["train_a_reverse"]["argv"]
+    assert arg(names["held_c_drive"], "--drive").endswith("videos/c.mp4")
+    assert arg(names["held_c_wrong"], "--drive-clip").endswith("videos/b.mp4")
+    assert arg(names["train_a_wrong"], "--drive-clip").endswith("videos/c.mp4")
+    assert "--no-drive" in names["held_c_none"]["argv"] and "--reverse-drive" in names["train_a_reverse"]["argv"]
     (work / "pass.txt").write_text("a.mp4\nb.mp4\nc.mp4\nd.mp4\n")
     changed = subprocess.run(["/bin/bash", str(script), "prep"], env=env, capture_output=True, text=True, timeout=10)
     assert changed.returncode == 1 and "other clips" in changed.stderr
