@@ -559,6 +559,7 @@ def launcher_env(tmp_path):
         folder.mkdir(parents=True)
         (folder / "config.json").write_text('{}')
     (work / "pass.txt").write_text("a.mp4\nb.mp4\n\nc.mp4\n")
+    (root / "ckpts/sam2.1-hiera-large").mkdir(parents=True)
     env = dict(os.environ, WORK=str(work), CKPT_5B=str(tmp_path / "model"), VIDEOS=str(tmp_path / "videos"),
                HOLDOUT="2", CKPT_DIR=str(tmp_path / "ckpts"),
                GPUS="0,1", ENV_PREFIX=str(binary.parent), STEPS="4", RUN="run_wa2", CACHE="cache_wa2",
@@ -587,7 +588,7 @@ if "train/train_wa2_ti2v5b.py" in sys.argv:
                             text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
     calls = [json.loads(line) for line in (work / "calls.jsonl").read_text().splitlines()]
-    assert len(calls) == 12 and all(c["offline"] == "1" for c in calls)
+    assert len(calls) == 12
     assert (work / "wa2_train.txt").read_text() == "a.mp4\n"
     assert (work / "wa2_holdout.txt").read_text() == "b.mp4\nc.mp4\n"
     prep_calls = [c for c in calls if "train/prep_wa2_ti2v5b.py" in c["argv"]]
@@ -596,6 +597,7 @@ if "train/train_wa2_ti2v5b.py" in sys.argv:
         assert c["argv"][c["argv"].index("--list") + 1] == str(work / "wa2_train.txt")
         assert "--t5-wan" in c["argv"] and "--blur-sigma" in c["argv"]
         assert c["argv"][c["argv"].index("--gdino") + 1] == "IDEA-Research/grounding-dino-base"
+        assert c["argv"][c["argv"].index("--sam2") + 1] == str(script.parents[1] / "ckpts/sam2.1-hiera-large")
     assert {c["gpu"] for c in prep_calls[1:]} == {"0", "1"}
     assert all(str(work / "old_cache") in c["argv"] for c in prep_calls[1:])
     training = next(c for c in calls if "train/train_wa2_ti2v5b.py" in c["argv"])

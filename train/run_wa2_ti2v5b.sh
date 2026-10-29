@@ -8,7 +8,7 @@
 # infer  latest QKV on a held-out clip and on a training clip, reference = the clip's own frame 1 s after the window;
 #        controls: drive | none (no driving) | reverse (time-reversed driving) | wrong (another clip's driving)
 #        -> $WORK/infer_wa2/<held|train>_<clip>_<control>.mp4 (+ _side.mp4 = blurred drive | output), 4 runs at a time
-# Knobs (env): VIDEOS CKPT_5B CKPT_DIR (GDINO/SAM2) WORK GPUS STEPS RUN CACHE WEIGHTS BLUR_SIGMA HOLDOUT PREVIEW REUSE_TARGET
+# Knobs (env): VIDEOS CKPT_5B CKPT_DIR GDINO SAM2 WORK GPUS STEPS RUN CACHE WEIGHTS BLUR_SIGMA HOLDOUT PREVIEW REUSE_TARGET
 #   T5_WAN T5_TOKENIZER MASTER_PORT
 set -euo pipefail
 pids=()
@@ -25,7 +25,6 @@ trap 'exit 143' TERM
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ENV_PREFIX=${ENV_PREFIX:-/home/ma-user/anaconda3/envs/wan_animate_2}
 [[ -d $ENV_PREFIX/bin ]] && export PATH="$ENV_PREFIX/bin:$PATH" PYTHONNOUSERSITE=1
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 VIDEOS=${VIDEOS:-/cache/humanvid_real/vertical_static}
 CKPT_5B=${CKPT_5B:-/cache/WAN2.2-TI2V-5B-Diffusers/WAN2.2-TI2V-5B-Diffusers}
 WORK=${WORK:-/cache/pilot_ti2v5b}
@@ -39,8 +38,14 @@ FRAMES=${FRAMES:-33}
 HOLDOUT=${HOLDOUT:-4}
 PREVIEW=${PREVIEW:-4}
 CKPT_DIR=${CKPT_DIR:-/home/ma-user/work/l00996894/ckpts}
-GDINO=${GDINO:-$CKPT_DIR/grounding-dino-base}; [[ -d $GDINO ]] || GDINO=IDEA-Research/grounding-dino-base
-SAM2=${SAM2:-$CKPT_DIR/sam2.1-hiera-large}; [[ -d $SAM2 ]] || SAM2=facebook/sam2.1-hiera-large
+mask_model() {  # name hf_id: $CKPT_DIR/<name>, else <repo>/ckpts/<name> (the pilot's filter), else the HF id (download)
+  local d
+  for d in "$CKPT_DIR/$1" "$REPO/ckpts/$1"; do [[ -d $d ]] && { echo "$d"; return; }; done
+  echo "note: $1 not in $CKPT_DIR or $REPO/ckpts: downloading $2 from HF (needs internet; or set it)" >&2
+  echo "$2"
+}
+GDINO=${GDINO:-$(mask_model grounding-dino-base IDEA-Research/grounding-dino-base)}
+SAM2=${SAM2:-$(mask_model sam2.1-hiera-large facebook/sam2.1-hiera-large)}
 STAGES=${*:-prep train infer}
 IFS=, read -r -a GPU <<< "$GPUS"
 N=${#GPU[@]}

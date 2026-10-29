@@ -90,8 +90,8 @@ Prep jointly encodes `[reference, clip[1:]]` as the target and encodes the origi
 masks select a deterministic latent Gaussian blur (sigma 2, one-cell mask dilation). No driving noise or pixel
 augmentation is added. Frame 0 is conditioning, not reconstruction. The new versioned cache keeps samples under
 `samples/`; the pilot and WA2 loaders refuse each other's caches. `REUSE_TARGET=cache` can reuse matching pilot
-targets; the drive is always re-encoded. All model/tokenizer/mask checkpoints must already be local (GDINO/SAM2 default
-to `$CKPT_DIR/grounding-dino-base` and `$CKPT_DIR/sam2.1-hiera-large`, else the HF ids in the local HF cache). The
+targets; the drive is always re-encoded. The TI2V-5B weights must be local; GDINO/SAM2 are taken from
+`$CKPT_DIR/<name>`, else `<repo>/ckpts/<name>` (as in the pilot's filter stage), else downloaded by HF id. The
 last `HOLDOUT=4` clips of `pass.txt` are kept out of training (`wa2_holdout.txt`) for the evaluation below.
 
 Reuse `$WORK/pass.txt` from the pilot's filter/select stages, then run:

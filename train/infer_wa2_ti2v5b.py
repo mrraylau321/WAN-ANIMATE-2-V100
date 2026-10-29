@@ -76,7 +76,6 @@ def main():
     a = p.parse_args()
     if bool(a.ref) == a.ref_from_drive:
         p.error("give --ref or --ref-from-drive")
-    os.environ["HF_HUB_OFFLINE"] = os.environ["TRANSFORMERS_OFFLINE"] = "1"
     from diffusers import AutoencoderKLWan, WanTransformer3DModel
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # fp32 load, as in the pilot (fp16 from_pretrained needs accelerate), then fp16 storage

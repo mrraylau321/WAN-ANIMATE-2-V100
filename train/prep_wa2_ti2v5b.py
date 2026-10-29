@@ -66,7 +66,7 @@ def person_masks(raw, detector, segmenter, width=480, height=832):
 
 
 def load_mask_models(gdino, sam2):
-    """Local dirs or HF ids already in the cache (HF_HUB_OFFLINE)."""
+    """Local dirs or HF ids (downloaded once into the HF cache); the TI2V-5B weights are always local_files_only."""
     from grounded_sam2 import Detector, Segmenter
     return Detector(gdino, 0.35, 0.25), Segmenter(sam2)
 
@@ -203,7 +203,6 @@ def main():
     a = p.parse_args()
     if not math.isfinite(a.blur_sigma) or a.blur_sigma <= 0:
         p.error("--blur-sigma must be positive and finite")
-    os.environ["HF_HUB_OFFLINE"] = os.environ["TRANSFORMERS_OFFLINE"] = "1"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     names = ([line.strip() for line in open(a.list) if line.strip()] if a.list else
              sorted(os.path.basename(f) for f in glob.glob(os.path.join(a.videos, "*.mp4"))))
