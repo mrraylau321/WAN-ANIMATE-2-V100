@@ -4,7 +4,7 @@
 #   bash scripts/run_move_cases.sh                       all cases below
 #   bash scripts/run_move_cases.sh pink_girl__heart_hands one case
 # Inputs: $IN (default <repo>/inputs/move_mode) with the renamed files
-#   ref_beach_man.jpg  ref_pink_girl.jpg  drive_beach_jump.mp4  drive_beach_kick.mp4  drive_heart_hands.mp4
+#   ref_beach_girl.jpg  ref_pink_girl.jpg  drive_beach_jump.mp4  drive_beach_kick.mp4  drive_heart_hands.mp4
 # Output: ~/ray_runs/move/<case>/<session>/results.mp4, plus a copy at ~/ray_runs/move/<case>.mp4
 # Box: 4x V100 32GB -> GPUS=0,1,2,3, MODE=distill, bf16 DiT shards (same settings as scripts/run_v100_replace.sh).
 # Knobs (env): IN CKPT_DIR GPUS MODE RES PROMPT (default " " = no prompt) SEED
@@ -20,8 +20,8 @@ export PROMPT=${PROMPT:- }
 OUT=${OUT:-$HOME/ray_runs/move}
 
 # case name | reference photo | driving clip
-CASES="beach_man__beach_jump|ref_beach_man.jpg|drive_beach_jump.mp4
-beach_man__beach_kick|ref_beach_man.jpg|drive_beach_kick.mp4
+CASES="beach_girl__beach_jump|ref_beach_girl.jpg|drive_beach_jump.mp4
+beach_girl__beach_kick|ref_beach_girl.jpg|drive_beach_kick.mp4
 pink_girl__heart_hands|ref_pink_girl.jpg|drive_heart_hands.mp4"
 
 want=" $* "
