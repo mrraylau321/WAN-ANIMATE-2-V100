@@ -238,6 +238,7 @@ def main():
     p.add_argument("--save-every", type=int, default=500, help="state.pt ~10 GB + a 3.4 GB QKV export each time")
     p.add_argument("--weights", choices=["fp16", "fp32"], default="fp16")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--only", help="file listing sample names (one per line) to train on: the overfit test")
     p.add_argument("--sync-to", help="obs://bucket/path (MoXing) or a folder: each save is copied there, and a fresh "
                                      "machine without --out/state.pt resumes from it")
     a = p.parse_args()
@@ -257,7 +258,8 @@ def main():
     set_shared_qkv_trainable(model)
     assert_5b(model)
     log = lambda msg: print(f"[rank {rank}] {msg}", flush=True)
-    train(model, CachedLatents(a.data), a.steps, a.out, lr=a.lr, shift=a.shift, accum=a.accum,
+    only = [l.strip() for l in open(a.only) if l.strip()] if a.only else None
+    train(model, CachedLatents(a.data, only), a.steps, a.out, lr=a.lr, shift=a.shift, accum=a.accum,
           save_every=a.save_every, seed=a.seed, device=device, amp=device != "cpu", use_checkpoint=True,
           rank=rank, world=world, log=log, model_dir=a.model, sync_to=a.sync_to)
     if world > 1:

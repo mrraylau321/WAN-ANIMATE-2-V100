@@ -13,6 +13,13 @@
 #   SAVE_EVERY (500) SYNC_TO (obs://bucket/path: every save is also copied there with MoXing; a fresh machine resumes
 #   from it)
 #   T5_WAN T5_TOKENIZER MASTER_PORT
+# Overfit test (does the training reach the driving branch at all?), after prep:
+#   OVERFIT=8 bash train/run_wa2_ti2v5b.sh train infer
+#   train  on the 8 samples of the most-moving training clips ($WORK/$RUN/overfit_samples.txt), RUN=run_overfit8,
+#          STEPS=400, SAVE_EVERY=200 unless set
+#   infer  on 2 of those samples straight from the cache (--sample: no VAE encode / masks), controls drive | none |
+#          wrong (the other sample's drive) | base (untrained model, drive) -> $WORK/infer_wa2/overfit_*_side.mp4
+#          = blurred drive | output | ground truth. Pass: drive ≈ ground truth, none / wrong / base clearly differ.
 set -euo pipefail
 pids=()
 cleanup() {
@@ -32,6 +39,11 @@ VIDEOS=${VIDEOS:-/cache/humanvid_real/vertical_static}
 CKPT_5B=${CKPT_5B:-/cache/WAN2.2-TI2V-5B-Diffusers/WAN2.2-TI2V-5B-Diffusers}
 WORK=${WORK:-/cache/pilot_ti2v5b}
 GPUS=${GPUS:-0,1,2,3}
+OVERFIT=${OVERFIT:-}
+if [[ -n $OVERFIT ]]; then
+  (( OVERFIT >= 2 )) || { echo "OVERFIT needs at least 2 samples (one is the other's wrong drive)" >&2; exit 2; }
+  RUN=${RUN:-run_overfit$OVERFIT}; STEPS=${STEPS:-400}; SAVE_EVERY=${SAVE_EVERY:-200}
+fi
 STEPS=${STEPS:-2000}
 RUN=${RUN:-run_wa2}
 CACHE=${CACHE:-cache_wa2}
@@ -83,6 +95,25 @@ print("\n".join(sorted(names, key=lambda n: -motion.get(n, 0.0))[:int(sys.argv[2
 PY
 }
 runs=0
+infer_sample() {  # sample other: the four overfit controls on one cached training sample, one GPU each
+  local s=$1 other=$2 control name
+  local -a extra q
+  for control in drive none wrong base; do
+    extra=(); q=(--qkv "$qkv")
+    [[ $control == none ]] && extra=(--no-drive)
+    [[ $control == wrong ]] && extra=(--drive-sample "$WORK/$CACHE/samples/$other")
+    [[ $control == base ]] && q=()
+    name=overfit_${s%.pt}_$control
+    logs+=("$WORK/infer_wa2/$name.log")
+    CUDA_VISIBLE_DEVICES=${GPU[$((runs % N))]} python train/infer_wa2_ti2v5b.py --model "$CKPT_5B" ${q[@]+"${q[@]}"} \
+      --text "$WORK/$CACHE/text.pt" --sample "$WORK/$CACHE/samples/$s" --frames "$FRAMES" --out "$WORK/infer_wa2" \
+      --name "$name" --weights "$WEIGHTS" --blur-sigma "$BLUR_SIGMA" ${extra[@]+"${extra[@]}"} \
+      > "$WORK/infer_wa2/$name.log" 2>&1 &
+    pids+=($!)
+    runs=$((runs + 1))
+    (( runs % N )) || wait_all
+  done
+}
 infer_clip() {  # kind clip other: the four controls of one clip, one GPU each
   local kind=$1 clip=$2 other=$3 control name
   local -a extra
@@ -135,13 +166,42 @@ for stage in $STAGES; do
     train)
       last=$WORK/$RUN/qkv_$(printf %06d "$STEPS").safetensors
       if [[ -f $last ]]; then echo "== train: $last exists, skipped"; continue; fi
+      ONLY=()
+      if [[ -n $OVERFIT ]]; then  # the samples of the most-moving training clips, both windows, fixed once per RUN
+        list=$WORK/$RUN/overfit_samples.txt
+        mkdir -p "$WORK/$RUN"
+        if [[ ! -f $list ]]; then
+          k=0; : > "$list.tmp"
+          while read -r clip; do
+            for w in 0 1; do
+              f=${clip%.*}_w$w.pt
+              if (( k < OVERFIT )) && [[ -f $WORK/$CACHE/samples/$f ]]; then echo "$f" >> "$list.tmp"; k=$((k + 1)); fi
+            done
+          done < <(moving "$WORK/wa2_train.txt" 1000000)
+          (( k >= 2 )) || { rm -f "$list.tmp"; echo "fewer than 2 samples found in $WORK/$CACHE/samples" >&2; exit 1; }
+          mv "$list.tmp" "$list"
+        fi
+        echo "== overfit: $(grep -c . "$list") samples ($list), $STEPS steps -> $WORK/$RUN"
+        ONLY=(--only "$list")
+      fi
       CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node "$N" --master_port "${MASTER_PORT:-29532}" \
         train/train_wa2_ti2v5b.py --model "$CKPT_5B" --data "$WORK/$CACHE" --out "$WORK/$RUN" \
         --steps "$STEPS" --weights "$WEIGHTS" --save-every "${SAVE_EVERY:-500}" ${SYNC_TO:+--sync-to "$SYNC_TO"} \
-        2>&1 | tee -a "$WORK/train_wa2.log" ;;
+        ${ONLY[@]+"${ONLY[@]}"} 2>&1 | tee -a "$WORK/train_wa2.log" ;;
     infer)
       qkv=$(ls "$WORK/$RUN"/qkv_*.safetensors 2>/dev/null | tail -1 || true)
       [[ -n $qkv ]] || { echo "no QKV in $WORK/$RUN: run train first" >&2; exit 1; }
+      mkdir -p "$WORK/infer_wa2"
+      if [[ -n $OVERFIT ]]; then
+        list=$WORK/$RUN/overfit_samples.txt
+        [[ -f $list ]] || { echo "no $list: run OVERFIT=$OVERFIT ... train first" >&2; exit 1; }
+        s1=$(sed -n 1p "$list"); s2=$(sed -n 2p "$list")
+        echo "== overfit infer $qkv: $s1, $s2 -> $WORK/infer_wa2/overfit_*_side.mp4 (drive | output | ground truth)"
+        infer_sample "$s1" "$s2"
+        infer_sample "$s2" "$s1"
+        wait_all
+        continue
+      fi
       [[ -f $WORK/wa2_holdout.txt && -f $WORK/wa2_train.txt ]] || { echo "run prep first (no holdout split)" >&2; exit 1; }
       held=$(moving "$WORK/wa2_holdout.txt" 2 | sed -n 1p); held2=$(moving "$WORK/wa2_holdout.txt" 2 | sed -n 2p)
       seen=$(moving "$WORK/wa2_train.txt" 1)

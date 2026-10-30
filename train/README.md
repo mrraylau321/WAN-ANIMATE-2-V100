@@ -111,3 +111,16 @@ motion score in `$WORK/scores_*.csv`), with the reference taken from the
 clip itself 1 s after the window (as in training). Each clip gets four controls: `drive` (its own blurred driving),
 `none` (`--no-drive`), `reverse` (`--reverse-drive`) and `wrong` (`--drive-clip` of another clip). Learned motion
 means `drive` follows the clip while `reverse`/`wrong` follow their own driving and `none` does not.
+
+### Overfit test (does the training reach the driving branch?)
+
+`OVERFIT=8 bash train/run_wa2_ti2v5b.sh train infer` trains (400 steps) on the 8 samples of the most-moving training clips,
+then runs inference on 2 of them straight from the cache (`infer_wa2_ti2v5b.py --sample`: reference = latent frame 0 of
+the target, the cached blurred drive; no VAE encode or masks). There are four controls per sample:
+- `drive`: the trained QKV with its own drive;
+- `none`: no driving;
+- `wrong`: the other sample's drive;
+- `base`: the untrained model with the drive.
+
+Each `*_side.mp4` shows blurred drive | output | ground truth. It passes when `drive` follows the ground truth's motion
+and `none` / `wrong` / `base` clearly differ from it. Then train on all data (and later on teacher pairs).

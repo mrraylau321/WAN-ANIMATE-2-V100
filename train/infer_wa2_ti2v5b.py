@@ -37,6 +37,17 @@ def sample(model, ref, drive, text, steps=40, shift=5.0, generator=None, amp=Fal
     return x
 
 
+def sample_conditions(path, drive_path=None):
+    """A cached training sample as inference input (the overfit test): reference = latent frame 0 of its target
+    (the target is VAE(reference + clip[1:]), so that slot is the reference encoded alone), driving = its cached
+    person-blurred drive, or another sample's drive (wrong-drive control). -> ref [1,C,1,h,w], drive [C,F,h,w], truth."""
+    s = torch.load(path, map_location="cpu", weights_only=True)
+    drive = torch.load(drive_path, map_location="cpu", weights_only=True)["drive"] if drive_path else s["drive"]
+    if drive.shape != s["target"].shape:
+        raise ValueError("driving and target latents differ in shape")
+    return s["target"][None, :, :1].float(), drive.float(), s["target"].float()
+
+
 def load_qkv(model, path, model_dir, blur_sigma):
     from safetensors import safe_open
     from safetensors.torch import load_file
@@ -58,7 +69,10 @@ def main():
     p.add_argument("--ref", help="reference image; or --ref-from-drive")
     p.add_argument("--ref-from-drive", action="store_true",
                    help="reference = the --drive clip's frame 1 s after the 33-frame window (as in training)")
-    p.add_argument("--drive", required=True)
+    p.add_argument("--drive", help="driving clip; or --sample")
+    p.add_argument("--sample", help="a cached training sample .pt (overfit test): its reference + drive, ground truth "
+                                    "shown beside the output; no VAE encode / masks needed")
+    p.add_argument("--drive-sample", help="with --sample: another sample's drive (wrong-drive control)")
     p.add_argument("--drive-clip", help="use another driving clip (wrong-drive control)")
     p.add_argument("--reverse-drive", action="store_true")
     p.add_argument("--no-drive", action="store_true")
@@ -74,8 +88,12 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--name")
     a = p.parse_args()
-    if bool(a.ref) == a.ref_from_drive:
+    if bool(a.drive) == bool(a.sample):
+        p.error("give --drive (a clip) or --sample (a cached training sample)")
+    if a.drive and bool(a.ref) == a.ref_from_drive:
         p.error("give --ref or --ref-from-drive")
+    if a.drive_sample and not a.sample:
+        p.error("--drive-sample needs --sample")
     from diffusers import AutoencoderKLWan, WanTransformer3DModel
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # fp32 load, as in the pilot (fp16 from_pretrained needs accelerate), then fp16 storage
@@ -92,6 +110,43 @@ def main():
     model.requires_grad_(False).eval()
     vae = AutoencoderKLWan.from_pretrained(os.path.join(a.model, "vae"), torch_dtype=torch.float32,
                                           local_files_only=True).to(device).requires_grad_(False).eval()
+    truth = None
+    if a.sample:
+        ref, drive, truth = sample_conditions(a.sample, a.drive_sample)
+        ref, drive = ref.to(device), drive.to(device)
+    else:
+        ref, drive = encode_inputs(a, vae, device)
+    vae.to("cpu")
+    if device != "cpu":
+        torch.cuda.empty_cache()
+    model.to(device)
+    text = torch.load(a.text, map_location="cpu", weights_only=True)["text"].to(device).float()
+    z = sample(model, ref, drive[None], text, a.steps, a.shift, torch.Generator().manual_seed(a.seed),
+               amp=device != "cpu", use_drive=not a.no_drive)
+    model.to("cpu")
+    if device != "cpu":
+        torch.cuda.empty_cache()
+    vae.to(device)
+    vae.enable_tiling()  # decode only: the drive and reference were encoded untiled, like the training cache
+    z[:, :, :1] = ref
+    output, blurred = vae_decode(vae, z), vae_decode(vae, drive[None])
+    panels = side_by_side(blurred, output)
+    if truth is not None:  # drive | output | ground truth
+        panels = side_by_side(panels, vae_decode(vae, truth[None].to(device)))
+    os.makedirs(a.out, exist_ok=True)
+    tag = os.path.splitext(os.path.basename(a.qkv))[0] if a.qkv else "base"
+    tag += "_nodrive" if a.no_drive else "_drive"
+    tag += "_wrong" if (a.drive_clip or a.drive_sample) else ""
+    tag += "_reverse" if a.reverse_drive else ""
+    name = a.name or f"{tag}_s{a.seed}"
+    write_video(os.path.join(a.out, name + ".mp4"), output, a.fps)
+    write_video(os.path.join(a.out, name + "_side.mp4"), panels, a.fps)
+    print(f"33 frames (frame 0 is conditioning), Euler guide=1, shift={a.shift}, "
+          f"sigmas={flow_sigmas(a.steps, a.shift).tolist()} -> {a.out}/{name}.mp4", flush=True)
+
+
+def encode_inputs(a, vae, device):
+    """Driving clip -> person-blurred drive latents (as in prep); reference image (or the clip's own frame) -> latent."""
     path = a.drive_clip or a.drive
     n, fps = video_info(path)
     idx = [round(j * fps / a.fps) for j in range(33)]
@@ -114,31 +169,7 @@ def main():
         ref_rgb = cover(read_frames(a.drive, [at])[0], 480, 832)
     else:
         ref_rgb = cover(cv2.cvtColor(cv2.imread(a.ref), cv2.COLOR_BGR2RGB), 480, 832)
-    ref = vae_encode(vae, ref_rgb[None], device)
-    vae.to("cpu")
-    if device != "cpu":
-        torch.cuda.empty_cache()
-    model.to(device)
-    text = torch.load(a.text, map_location="cpu", weights_only=True)["text"].to(device).float()
-    z = sample(model, ref, drive[None], text, a.steps, a.shift, torch.Generator().manual_seed(a.seed),
-               amp=device != "cpu", use_drive=not a.no_drive)
-    model.to("cpu")
-    if device != "cpu":
-        torch.cuda.empty_cache()
-    vae.to(device)
-    vae.enable_tiling()  # decode only: the drive and reference were encoded untiled, like the training cache
-    z[:, :, :1] = ref
-    output, blurred = vae_decode(vae, z), vae_decode(vae, drive[None])
-    os.makedirs(a.out, exist_ok=True)
-    tag = os.path.splitext(os.path.basename(a.qkv))[0] if a.qkv else "base"
-    tag += "_nodrive" if a.no_drive else "_drive"
-    tag += "_wrong" if a.drive_clip else ""
-    tag += "_reverse" if a.reverse_drive else ""
-    name = a.name or f"{tag}_s{a.seed}"
-    write_video(os.path.join(a.out, name + ".mp4"), output, a.fps)
-    write_video(os.path.join(a.out, name + "_side.mp4"), side_by_side(blurred, output), a.fps)
-    print(f"33 frames (frame 0 is conditioning), Euler guide=1, shift={a.shift}, "
-          f"sigmas={flow_sigmas(a.steps, a.shift).tolist()} -> {a.out}/{name}.mp4", flush=True)
+    return vae_encode(vae, ref_rgb[None], device), drive
 
 
 if __name__ == "__main__":

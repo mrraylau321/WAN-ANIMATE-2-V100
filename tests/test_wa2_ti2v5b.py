@@ -788,3 +788,76 @@ def test_qkv_export_load_and_base_identity(tmp_path):
     (base / "config.json").write_text('{"changed": true}')
     with pytest.raises(ValueError, match="different base"):
         inf.load_qkv(loaded, path, str(base), 2.0)
+
+
+def test_cached_latents_only_keeps_the_listed_samples(tmp_path):
+    full = write_cache(tmp_path / "cache")
+    names = sorted(os.path.basename(f) for f in full.files)
+    one = prep.CachedLatents(tmp_path / "cache", only=[names[1]])
+    assert [os.path.basename(f) for f in one.files] == [names[1]] and len(one) == 1
+    assert one.fingerprint != full.fingerprint
+    with pytest.raises(FileNotFoundError, match="missing_w0.pt"):
+        prep.CachedLatents(tmp_path / "cache", only=[names[0], "missing_w0.pt"])
+
+
+def test_sample_conditions_use_the_cached_reference_and_drive(tmp_path):
+    g = torch.Generator().manual_seed(0)
+    a = dict(target=torch.randn(48, 3, 4, 4, generator=g), drive=torch.randn(48, 3, 4, 4, generator=g))
+    b = dict(target=torch.randn(48, 3, 4, 4, generator=g), drive=torch.randn(48, 3, 4, 4, generator=g))
+    torch.save(a, tmp_path / "a.pt"); torch.save(b, tmp_path / "b.pt")
+    ref, drive, truth = inf.sample_conditions(str(tmp_path / "a.pt"))
+    assert ref.shape == (1, 48, 1, 4, 4) and torch.equal(ref[0, :, 0], a["target"][:, 0])
+    assert torch.equal(drive, a["drive"]) and torch.equal(truth, a["target"])
+    _, wrong, truth = inf.sample_conditions(str(tmp_path / "a.pt"), str(tmp_path / "b.pt"))
+    assert torch.equal(wrong, b["drive"]) and torch.equal(truth, a["target"])
+    torch.save(dict(target=a["target"], drive=torch.zeros(48, 2, 4, 4)), tmp_path / "c.pt")
+    with pytest.raises(ValueError, match="differ"):
+        inf.sample_conditions(str(tmp_path / "a.pt"), str(tmp_path / "c.pt"))
+
+
+def test_launcher_overfit_picks_moving_samples_and_runs_four_controls(tmp_path):
+    script, work, binary, env = launcher_env(tmp_path)
+    for key in ("STEPS", "RUN", "SYNC_TO"):
+        env.pop(key)
+    env["OVERFIT"] = "2"
+    stub = f"#!{sys.executable}\n" + '''import json, os, sys
+if sys.argv[1:2] == ["-"]:
+    os.execv(sys.executable, [sys.executable] + sys.argv[1:])
+from pathlib import Path
+work = Path(os.environ["WORK"])
+with open(work / "calls.jsonl", "a") as f:
+    f.write(json.dumps(dict(argv=sys.argv, gpu=os.environ.get("CUDA_VISIBLE_DEVICES"))) + "\\n")
+if "train/train_wa2_ti2v5b.py" in sys.argv:
+    out = Path(sys.argv[sys.argv.index("--out") + 1])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "qkv_000400.safetensors").touch()
+'''
+    for name in ("python", "torchrun"):
+        (binary / name).write_text(stub)
+        (binary / name).chmod(0o755)
+    (work / "wa2_train.txt").write_text("a.mp4\nb.mp4\n")
+    (work / "scores_0.csv").write_text("name,frames,fps,person_frac,multi_frac,height,motion\n"
+                                       "a.mp4,1,24,1,0,0.5,0.1\nb.mp4,1,24,1,0,0.5,0.9\n")
+    samples = work / "cache_wa2/samples"
+    samples.mkdir(parents=True)
+    for f in ("a_w0.pt", "a_w1.pt", "b_w0.pt"):
+        (samples / f).touch()
+    result = subprocess.run(["/bin/bash", str(script), "train", "infer"], env=env, capture_output=True, text=True,
+                            timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    listing = work / "run_overfit2/overfit_samples.txt"
+    assert listing.read_text() == "b_w0.pt\na_w0.pt\n"  # b moves most; b_w1 does not exist
+    calls = [json.loads(line) for line in (work / "calls.jsonl").read_text().splitlines()]
+    arg = lambda c, flag: c["argv"][c["argv"].index(flag) + 1] if flag in c["argv"] else None
+    training = next(c for c in calls if "train/train_wa2_ti2v5b.py" in c["argv"])
+    assert arg(training, "--only") == str(listing) and arg(training, "--steps") == "400"
+    assert arg(training, "--save-every") == "200" and arg(training, "--out") == str(work / "run_overfit2")
+    inference = {arg(c, "--name"): c for c in calls if "train/infer_wa2_ti2v5b.py" in c["argv"]}
+    assert set(inference) == {f"overfit_{s}_{c}" for s in ("b_w0", "a_w0") for c in ("drive", "none", "wrong", "base")}
+    assert all(arg(c, "--sample") and "--ref-from-drive" not in c["argv"] for c in inference.values())
+    assert arg(inference["overfit_b_w0_wrong"], "--drive-sample") == str(samples / "a_w0.pt")
+    assert arg(inference["overfit_a_w0_wrong"], "--drive-sample") == str(samples / "b_w0.pt")
+    assert "--no-drive" in inference["overfit_b_w0_none"]["argv"]
+    assert "--qkv" not in inference["overfit_b_w0_base"]["argv"] and "--qkv" in inference["overfit_b_w0_drive"]["argv"]
+    again = subprocess.run(["/bin/bash", str(script), "train"], env=env, capture_output=True, text=True, timeout=10)
+    assert again.returncode == 0 and "skipped" in again.stdout

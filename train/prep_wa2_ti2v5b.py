@@ -111,10 +111,16 @@ def validate_cache_manifest(folder):
 class CachedLatents(PilotCachedLatents):
     """New samples live below samples/: the pilot's root-level glob refuses this cache."""
 
-    def __init__(self, folder):
+    def __init__(self, folder, only=None):
+        """only: sample file names to keep (the overfit test); every one must exist."""
         self.folder = os.path.realpath(folder)
         self.manifest = validate_cache_manifest(folder)
         self.files = sorted(glob.glob(os.path.join(self.folder, "samples", "*.pt")))
+        if only is not None:
+            missing = sorted(set(only) - {os.path.basename(f) for f in self.files})
+            if missing:
+                raise FileNotFoundError(f"not in {folder}/samples: {', '.join(missing)}")
+            self.files = [f for f in self.files if os.path.basename(f) in set(only)]
         if not self.files:
             raise FileNotFoundError(f"no WA2 samples in {folder}")
         self.text = torch.load(os.path.join(folder, "text.pt"), map_location="cpu", weights_only=True)
