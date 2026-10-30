@@ -835,28 +835,32 @@ if "train/train_wa2_ti2v5b.py" in sys.argv:
     for name in ("python", "torchrun"):
         (binary / name).write_text(stub)
         (binary / name).chmod(0o755)
-    (work / "wa2_train.txt").write_text("a.mp4\nb.mp4\n")
+    (work / "wa2_train.txt").write_text("a.mp4\nb.mp4\nc.mp4\n")
     (work / "scores_0.csv").write_text("name,frames,fps,person_frac,multi_frac,height,motion\n"
-                                       "a.mp4,1,24,1,0,0.5,0.1\nb.mp4,1,24,1,0,0.5,0.9\n")
+                                       "a.mp4,1,24,1,0,0.5,0.1\nb.mp4,1,24,1,0,0.5,0.9\nc.mp4,1,24,1,0,0.5,0.5\n")
     samples = work / "cache_wa2/samples"
     samples.mkdir(parents=True)
-    for f in ("a_w0.pt", "a_w1.pt", "b_w0.pt"):
+    for f in ("a_w0.pt", "a_w1.pt", "b_w0.pt", "c_w0.pt"):
         (samples / f).touch()
     result = subprocess.run(["/bin/bash", str(script), "train", "infer"], env=env, capture_output=True, text=True,
                             timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     listing = work / "run_overfit2/overfit_samples.txt"
-    assert listing.read_text() == "b_w0.pt\na_w0.pt\n"  # b moves most; b_w1 does not exist
+    assert listing.read_text() == "b_w0.pt\nc_w0.pt\n"  # b, then c move most; b_w1 / c_w1 do not exist
     calls = [json.loads(line) for line in (work / "calls.jsonl").read_text().splitlines()]
     arg = lambda c, flag: c["argv"][c["argv"].index(flag) + 1] if flag in c["argv"] else None
     training = next(c for c in calls if "train/train_wa2_ti2v5b.py" in c["argv"])
     assert arg(training, "--only") == str(listing) and arg(training, "--steps") == "400"
     assert arg(training, "--save-every") == "200" and arg(training, "--out") == str(work / "run_overfit2")
     inference = {arg(c, "--name"): c for c in calls if "train/infer_wa2_ti2v5b.py" in c["argv"]}
-    assert set(inference) == {f"overfit_{s}_{c}" for s in ("b_w0", "a_w0") for c in ("drive", "none", "wrong", "base")}
+    assert set(inference) == {f"overfit_{s}_{c}" for s in ("b_w0", "c_w0")
+                              for c in ("drive", "none", "wrong", "base", "unseen")}
     assert all(arg(c, "--sample") and "--ref-from-drive" not in c["argv"] for c in inference.values())
-    assert arg(inference["overfit_b_w0_wrong"], "--drive-sample") == str(samples / "a_w0.pt")
-    assert arg(inference["overfit_a_w0_wrong"], "--drive-sample") == str(samples / "b_w0.pt")
+    assert arg(inference["overfit_b_w0_wrong"], "--drive-sample") == str(samples / "c_w0.pt")
+    assert arg(inference["overfit_c_w0_wrong"], "--drive-sample") == str(samples / "b_w0.pt")
+    # unseen = the most-moving sample outside the overfit list: a (a_w0)
+    assert arg(inference["overfit_b_w0_unseen"], "--drive-sample") == str(samples / "a_w0.pt")
+    assert arg(inference["overfit_c_w0_unseen"], "--drive-sample") == str(samples / "a_w0.pt")
     assert "--no-drive" in inference["overfit_b_w0_none"]["argv"]
     assert "--qkv" not in inference["overfit_b_w0_base"]["argv"] and "--qkv" in inference["overfit_b_w0_drive"]["argv"]
     again = subprocess.run(["/bin/bash", str(script), "train"], env=env, capture_output=True, text=True, timeout=10)

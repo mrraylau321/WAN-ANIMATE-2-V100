@@ -18,8 +18,11 @@
 #   train  on the 8 samples of the most-moving training clips ($WORK/$RUN/overfit_samples.txt), RUN=run_overfit8,
 #          STEPS=400, SAVE_EVERY=200 unless set
 #   infer  on 2 of those samples straight from the cache (--sample: no VAE encode / masks), controls drive | none |
-#          wrong (the other sample's drive) | base (untrained model, drive) -> $WORK/infer_wa2/overfit_*_side.mp4
-#          = blurred drive | output | ground truth. Pass: drive ≈ ground truth, none / wrong / base clearly differ.
+#          wrong (the other sample's drive) | base (untrained model, drive) | unseen (the drive of the most-moving
+#          sample NOT trained on) -> $WORK/infer_wa2/overfit_*_side.mp4 = blurred drive | output | ground truth.
+#          Pass: drive ≈ ground truth, none / wrong / base clearly differ. unseen: following the new motion = it reads
+#          motion; static or the trained motion = it memorised.
+#   Only the inference again (e.g. while another run trains elsewhere): OVERFIT=8 bash train/run_wa2_ti2v5b.sh infer
 set -euo pipefail
 pids=()
 cleanup() {
@@ -95,13 +98,15 @@ print("\n".join(sorted(names, key=lambda n: -motion.get(n, 0.0))[:int(sys.argv[2
 PY
 }
 runs=0
-infer_sample() {  # sample other: the four overfit controls on one cached training sample, one GPU each
-  local s=$1 other=$2 control name
-  local -a extra q
-  for control in drive none wrong base; do
+infer_sample() {  # sample other unseen: the overfit controls on one cached training sample, one GPU each
+  local s=$1 other=$2 unseen=${3:-} control name
+  local -a extra q controls=(drive none wrong base)
+  [[ -n $unseen ]] && controls+=(unseen)
+  for control in "${controls[@]}"; do
     extra=(); q=(--qkv "$qkv")
     [[ $control == none ]] && extra=(--no-drive)
     [[ $control == wrong ]] && extra=(--drive-sample "$WORK/$CACHE/samples/$other")
+    [[ $control == unseen ]] && extra=(--drive-sample "$WORK/$CACHE/samples/$unseen")
     [[ $control == base ]] && q=()
     name=overfit_${s%.pt}_$control
     logs+=("$WORK/infer_wa2/$name.log")
@@ -196,9 +201,14 @@ for stage in $STAGES; do
         list=$WORK/$RUN/overfit_samples.txt
         [[ -f $list ]] || { echo "no $list: run OVERFIT=$OVERFIT ... train first" >&2; exit 1; }
         s1=$(sed -n 1p "$list"); s2=$(sed -n 2p "$list")
-        echo "== overfit infer $qkv: $s1, $s2 -> $WORK/infer_wa2/overfit_*_side.mp4 (drive | output | ground truth)"
-        infer_sample "$s1" "$s2"
-        infer_sample "$s2" "$s1"
+        unseen=""  # the drive of the most-moving sample the overfit run never saw: reads motion, or recalls it?
+        while read -r clip; do
+          f=${clip%.*}_w0.pt
+          if [[ -f $WORK/$CACHE/samples/$f ]] && ! grep -qx "$f" "$list"; then unseen=$f; break; fi
+        done < <(moving "$WORK/wa2_train.txt" 1000000)
+        echo "== overfit infer $qkv: $s1, $s2 (unseen drive: ${unseen:-none found}) -> $WORK/infer_wa2/overfit_*_side.mp4"
+        infer_sample "$s1" "$s2" "$unseen"
+        infer_sample "$s2" "$s1" "$unseen"
         wait_all
         continue
       fi
